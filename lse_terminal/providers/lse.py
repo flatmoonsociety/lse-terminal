@@ -211,21 +211,90 @@ class LseProvider(Provider):
         out.extend(rest[: max(0, limit - len(out))])
         return out[:limit]
 
-    def candles(self, symbol: str, timeframe: str, limit: int = 500,
-                start: str | None = None, end: str | None = None) -> pd.DataFrame:
-        if timeframe == "tick":
-            return self._tick_candles(symbol, limit=limit, start=start, end=end)
-        rows = self._lse().candles(symbol, timeframe=timeframe, start=start,
-                                   end=end, limit=min(int(limit), 5000),
-                                   order="desc" if not start else "asc")
+    # Rows per hosted /candles call: the gate's synchronous row cap
+    # (api_plans.max_rows_per_request, the same 5000 on every plan). Longer
+    # loads page through it below.
+    _PAGE_ROWS = 5000
+
+    @staticmethod
+    def _gate_ts(value) -> str | None:
+        """A start/end bound in the one shape the hosted gate accepts.
+
+        The gate takes `YYYY-MM-DD` or `YYYY-MM-DD[T ]HH:MM[:SS]` and 400s on
+        anything else, including the `+00:00` suffix that
+        datetime.isoformat() appends to an aware UTC value (which is exactly
+        what the engine's windowed backtest load sends). Epoch seconds and
+        tz-aware ISO strings both become naive UTC here; a value already in
+        gate shape passes through untouched.
+        """
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        s = str(value).strip()
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                return datetime.fromtimestamp(float(s), timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                return s  # not ours to judge; the gate's own error surfaces
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    @staticmethod
+    def _candle_frame(rows) -> pd.DataFrame:
         df = pd.DataFrame(rows)
         if df.empty:
             return pd.DataFrame(columns=CANDLE_COLUMNS)
         df["ts"] = df["timestamp"].map(_iso_to_epoch)
         for col in ("open", "high", "low", "close", "volume"):
             df[col] = pd.to_numeric(df.get(col, 0.0), errors="coerce")
-        df = df[CANDLE_COLUMNS].dropna(subset=["open", "high", "low", "close"])
-        return df.sort_values("ts").reset_index(drop=True)
+        return df[CANDLE_COLUMNS].dropna(subset=["open", "high", "low", "close"])
+
+    def candles(self, symbol: str, timeframe: str, limit: int = 500,
+                start: str | None = None, end: str | None = None) -> pd.DataFrame:
+        if timeframe == "tick":
+            return self._tick_candles(symbol, limit=limit, start=start, end=end)
+        # Paged load. One call returns at most _PAGE_ROWS, which capped every
+        # hosted backtest at 5000 bars however much the engine asked for (its
+        # remote ceiling is 50k). Pages walk the gate's own bound semantics:
+        # start is inclusive, end is exclusive, and a start-anchored query
+        # pages FORWARD (oldest first) while everything else returns the
+        # newest rows first, so a backward page ends exactly at the previous
+        # page's oldest bar and a forward page starts one second past its
+        # newest. Each page is ~0.3 s at the edge, so a full 50k load is a few
+        # seconds; a chart's 5000-bar request is still exactly one call.
+        want = max(1, int(limit))
+        s, e = self._gate_ts(start), self._gate_ts(end)
+        forward = bool(s)
+        client = self._lse()
+        frames: list[pd.DataFrame] = []
+        got = 0
+        while got < want:
+            page = min(self._PAGE_ROWS, want - got)
+            rows = client.candles(symbol, timeframe=timeframe, start=s, end=e,
+                                  limit=page, order="asc" if forward else "desc")
+            df = self._candle_frame(rows)
+            if df.empty:
+                break
+            frames.append(df)
+            got += len(df)
+            if len(rows) < page:
+                break  # the vault ran out of history in this direction
+            if forward:
+                s = self._gate_ts(int(df["ts"].max()) + 1)
+            else:
+                e = self._gate_ts(int(df["ts"].min()))
+        if not frames:
+            return pd.DataFrame(columns=CANDLE_COLUMNS)
+        out = (pd.concat(frames, ignore_index=True)
+               .drop_duplicates(subset="ts").sort_values("ts"))
+        # Provider law: start-anchored queries hand back the oldest N from
+        # start, everything else the newest N.
+        out = out.head(want) if forward else out.tail(want)
+        return out.reset_index(drop=True)
 
     # Default tick-history window. 30 minutes of a liquid pair (~24 ticks/s
     # on BTC/USD) roughly fills the chart's 5000-bar

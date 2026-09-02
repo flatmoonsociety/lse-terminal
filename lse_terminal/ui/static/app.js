@@ -1862,6 +1862,28 @@ function csBrokerCard(d, hub, opts) {
     note.textContent = accessNote;
     card.appendChild(note);
   }
+  // The broker's own launch line and support door (directory extra.welcome
+  // and extra.support). We serve the row but the words are the broker's, so
+  // they land as text, and the link only when it is https or mailto: the same
+  // bar SPEC 3.1 sets for adapter-supplied fields. Still no colours, no art
+  // beyond the logo above.
+  const extra = (d && d.extra) || {};
+  if (extra.welcome) {
+    const w = document.createElement("div");
+    w.className = "cs-note";
+    w.textContent = String(extra.welcome).slice(0, 160);
+    card.appendChild(w);
+  }
+  const support = String(extra.support || "");
+  if (/^(https:\/\/|mailto:)[^\s]+$/.test(support)) {
+    const s = document.createElement("a");
+    s.className = "cs-support";
+    s.href = support;
+    s.target = "_blank";
+    s.rel = "noopener";
+    s.textContent = support.replace(/^mailto:/, "");
+    card.appendChild(s);
+  }
 
   // Credential form: built from the directory's field descriptors, hidden until
   // the user presses Connect on a broker that has one.
@@ -8056,7 +8078,11 @@ function openManualBacktest() {
   $("charts").classList.add("hidden");
   $("manual-backtest").classList.remove("hidden");
   window.LSEManualBacktest.mount($("manual-backtest"), {
-    provider: dataProvider(),
+    // Default the replay source to the full LSE catalog when its key is
+    // configured (what "pick any pair" means); the dialog's Data Source
+    // selector can still switch to My Data or another vendor. Without a key,
+    // fall back to whatever source the shell last used.
+    provider: state.lseConfigured ? "lse" : dataProvider(),
     // Backing out of the setup dialog lands on Algo Development (the
     // default mode) rather than stranding the user on an empty pane.
     onExit: () => { openBacktest("py"); },
@@ -8434,9 +8460,12 @@ async function openBacktest(mode) {
     $(id).classList.add("hidden");
   }
   closeManualBacktest();
-  // Backtests run on the user's own files; flip the source now so every
-  // mode and the sidebar library inherit it.
-  if (state.provider !== "userdata") switchProvider("userdata");
+  // Algo Development and ML run on the user's own imported files; flip the
+  // source so those modes and the sidebar library inherit it. Manual backtest
+  // is exempt: its setup dialog chooses the data source itself (the full LSE
+  // catalog by default), so forcing My Data here would hide every hosted
+  // instrument from the one mode meant to replay any pair.
+  if (mode !== "manual" && state.provider !== "userdata") switchProvider("userdata");
   if (mode === "manual") {
     btSaveMode("manual");
     openManualBacktest();
@@ -12111,6 +12140,7 @@ function setupMLConfig() {
   $("ml-ds-build").onclick = openDatasetBuilder;
   $("ml-ds-cancel").onclick = () => $("ml-ds-modal").classList.add("hidden");
   $("ml-ds-create").onclick = createMLDataset;
+  $("ml-ds-source").onchange = mlDsSyncTf;
   $("ml-code").addEventListener("input", mlHighlight);
   $("ml-code").addEventListener("scroll", mlSyncScroll);
   // Picking a dataset rewrites the blueprint's dataset= line in place, so
@@ -12140,10 +12170,33 @@ async function refreshMLDatasets() {
   const names = built.map((b) => b.name);
   for (const i of imports) if (!names.includes(i.symbol)) names.push(i.symbol);
   ml.datasets = names;
+  ml.imports = imports;
   $("ml-ds-pick").innerHTML = '<option value="">insert dataset&hellip;</option>' +
     names.map((n) => `<option>${mlEsc(n)}</option>`).join("");
   $("ml-ds-source").innerHTML =
     imports.map((i) => `<option>${mlEsc(i.symbol)}</option>`).join("");
+  mlDsSyncTf();
+}
+
+/* The builder's timeframe menu offers only what the chosen import can
+   actually serve: its native bar size and clean multiples of it. The
+   engine refuses anything finer (a daily file cannot yield hourly bars),
+   so an impossible choice must never be selectable; before this, the
+   default 1h on a daily sample failed the build with an opaque 502. */
+const ML_DS_TFS = [["1s", 1], ["30s", 30], ["1m", 60], ["5m", 300],
+                   ["15m", 900], ["30m", 1800], ["1h", 3600],
+                   ["4h", 14400], ["1d", 86400], ["1w", 604800]];
+function mlDsSyncTf() {
+  const entry = (ml.imports || []).find((i) => i.symbol === $("ml-ds-source").value);
+  const native = ML_DS_TFS.find(([t]) => t === (entry || {}).timeframe);
+  const usable = native
+    ? ML_DS_TFS.filter(([, s]) => s >= native[1] && s % native[1] === 0)
+    // Unknown native resolution: keep the historic 1m..1d menu.
+    : ML_DS_TFS.filter(([, s]) => s >= 60 && s <= 86400);
+  const sel = $("ml-ds-tf");
+  const prev = sel.value;
+  sel.innerHTML = usable.map(([t]) => `<option>${t}</option>`).join("");
+  sel.value = usable.some(([t]) => t === prev) ? prev : usable[0][0];
 }
 
 /* A model click writes its blueprint (the settings schema rendered as
@@ -12222,6 +12275,7 @@ function openDatasetBuilder() {
     }
   }
   $("ml-ds-err").classList.add("hidden");
+  mlDsSyncTf();
   $("ml-ds-modal").classList.remove("hidden");
 }
 
@@ -13628,7 +13682,7 @@ async function pyBacktest() {
         // Always the engine maximum; the bars input was toolbar clutter.
         // Raised together with the server cap so a run covers the full
         // bundled samples, not their last 5000 bars.
-        limit: 50000,
+        limit: 100000,
         options: { extended_stats: true },
       }),
     });
@@ -14327,7 +14381,7 @@ async function wsxBacktest() {
         script: (wsx.bufs[wsx.open] || {}).content || "",
         // Engine maximum, same as the BACKTEST tab: a run covers the full
         // bundled samples, not their tail.
-        limit: 50000,
+        limit: 100000,
         options: { extended_stats: true },
       }),
     });

@@ -215,6 +215,20 @@ const ProChart: React.FC<ProChartProps> = ({
   const prevCandlesLengthRef = useRef<number>(0);
   const prevDimensionWidthRef = useRef<number>(0);
   const replayUserScrolledRef = useRef<boolean>(false);
+  // Reliable timeframe-switch detection for the replay refit. Comparing candle
+  // counts alone is asymmetric (a switch to a FINER timeframe grows the array,
+  // so "count shrank" misses it), which left 5m looking zoomed in after a hop
+  // up to 1W. The prop flag catches the switch in both directions; the refit
+  // effect consumes and clears it.
+  const prevReplayTfRef = useRef<string>(timeframe);
+  const pendingTfRefitRef = useRef<boolean>(false);
+  // Last bar's timestamp on the previous replay follow pass: tells appends
+  // (feed advanced) apart from prepends (scrollback history loaded).
+  const prevReplayLastTsRef = useRef<any>(null);
+  // Previous replay candle array (reference retained one generation): the
+  // view anchor bar is re-found in the new array by timestamp, which stays
+  // exact through prepends, evictions and partial-bucket rewrites.
+  const prevReplayCandlesRef = useRef<CandleData[] | null>(null);
   // Tracks the last-seen prependShift value. When the parent increments prependShift
   // (after loadMoreHistory prepends candles), we shift viewState.startIndex by the delta
   // so the user's visible view stays on the same candles (no visual jump).
@@ -4638,7 +4652,11 @@ const ProChart: React.FC<ProChartProps> = ({
           if (x > chartWidth) break;
 
           const futureTime = lastCandle.time + (i * labelInterval * timeIncrement);
-          const timeStr = formatTime(futureTime);
+          // Match the past-label formatter: getTimeLabel renders a date on
+          // daily/weekly timeframes, where formatTime would print "00:00" for
+          // every midnight-aligned future slot and fill the empty replay space
+          // with a row of identical 00:00 labels.
+          const timeStr = getTimeLabel(futureTime, new Date(futureTime).getFullYear());
 
           const labelW = ctx.measureText(timeStr).width;
           const leftEdge = x - labelW / 2;
@@ -6923,9 +6941,14 @@ const ProChart: React.FC<ProChartProps> = ({
       // In replay mode: auto-scroll whenever candle count changes (play/step/batch/TF switch)
       const prevLength = prevCandlesLengthRef.current;
       const chartWidth = dimensions.width - PRICE_AXIS_WIDTH;
-      const candleSpacing = viewState.candleWidth * (1 + CANDLE_GAP_RATIO);
-      const visibleCount = Math.floor(chartWidth / candleSpacing);
-      const targetPosition = Math.floor(visibleCount * 0.9);
+
+      // Latch a timeframe switch from the prop so the refit fires in BOTH
+      // directions (a hop to a finer timeframe grows the candle array and would
+      // never look like a "shrink").
+      if (timeframe !== prevReplayTfRef.current) {
+        prevReplayTfRef.current = timeframe;
+        pendingTfRefitRef.current = true;
+      }
 
       // Detect if this is the first time we have real dimensions (not the 300px default)
       const prevWidth = prevDimensionWidthRef.current;
@@ -6934,25 +6957,154 @@ const ProChart: React.FC<ProChartProps> = ({
 
       // Scroll when candle count changes (grows during play, or shrinks/changes on TF switch)
       // Also scroll when dimensions become real for the first time (fixes initial positioning)
-      if (candles.length !== prevLength || prevLength === 0 || dimensionsJustBecameReal) {
-        const isTfSwitch = prevLength > 0 && candles.length < prevLength;
+      if (candles.length !== prevLength || prevLength === 0 || dimensionsJustBecameReal || pendingTfRefitRef.current) {
+        // A real timeframe switch is detected ONLY by the prop latch. The
+        // old "length shrank" heuristic predates the latch and misfired on
+        // eviction: when forward replay pages push the raw window over its
+        // cap, old bars are dropped and the aggregated array legitimately
+        // shrinks, which recentered the view onto the newest bar AND
+        // re-armed auto-follow, yanking a user who had panned back into
+        // history straight back to the current price.
+        const isTfSwitch = pendingTfRefitRef.current;
+        const isRefit = prevLength === 0 || isTfSwitch || dimensionsJustBecameReal;
 
-        // Check if the latest candle is currently visible on screen
-        const currentStart = Math.max(0, Math.floor(viewState.startIndex));
+        // On a refit, resize the bars so the loaded series fills the viewport
+        // rather than keeping the previous timeframe's width. A sparse
+        // timeframe (few daily/weekly bars) kept at a fine timeframe's narrow
+        // width crushed into the left edge with an empty grid to the right;
+        // a rich timeframe kept at a coarse width showed only a handful of
+        // bars. Target a comfortable count, but never wider than the series
+        // itself needs, and clamp to sane on-screen sizes.
+        const TARGET_VISIBLE = 120;
+        let width = viewState.candleWidth;
+        if (isRefit) {
+          const shownBars = Math.max(1, Math.min(candles.length, TARGET_VISIBLE));
+          const desired = (chartWidth * 0.9) / shownBars / (1 + CANDLE_GAP_RATIO);
+          width = Math.min(40, Math.max(2, desired));
+        }
+        const candleSpacing = width * (1 + CANDLE_GAP_RATIO);
+        const visibleCount = Math.floor(chartWidth / candleSpacing);
+        const targetPosition = Math.floor(visibleCount * 0.9);
+
+        // Check if the latest candle is currently visible on screen. Read the
+        // LIVE position while a drag/wheel is in flight: mid-gesture the real
+        // startIndex lives in scrollStateRef and viewState is stale at the
+        // pre-gesture value, so the old viewState read judged "latest still
+        // visible" while the user was already far back in history.
+        const liveStartIndex = isScrollingRef.current
+          ? scrollStateRef.current.startIndex : viewState.startIndex;
+        const currentStart = Math.max(0, Math.floor(liveStartIndex));
         const currentEnd = Math.min(candles.length, currentStart + visibleCount);
-        const latestCandleVisible = (candles.length - 1) < currentEnd;
+        // "Was the user at the right edge?" must be judged against the array
+        // as it was BEFORE this batch of bars arrived. Judging against the
+        // new array meant a large append (the 30k-bar forward preload that
+        // fires at session start) instantly put the newest bar thousands of
+        // bars off-screen, the gate said "not at the edge", the follow never
+        // ran, and the view stayed stranded months back while the replay
+        // played on unseen.
+        const prevEdgeLen = prevLength > 0 ? prevLength : candles.length;
+        const latestCandleVisible = (prevEdgeLen - 1) < currentEnd;
 
         // Auto-scroll when: initial load, TF switch, dimensions just loaded,
         // or the latest candle is still visible AND user hasn't manually panned away.
         // Without the replayUserScrolledRef check, every new candle during replay
         // would force-scroll the chart back to the right edge, making it impossible
         // for the user to look at older candles while playback is running.
-        if (prevLength === 0 || isTfSwitch || dimensionsJustBecameReal || (latestCandleVisible && !replayUserScrolledRef.current)) {
-          const newStartIndex = Math.max(0, candles.length - 1 - targetPosition);
-          setViewState(prev => ({ ...prev, startIndex: newStartIndex, autoFollowLatest: false }));
+        // Never while a pan/wheel gesture is active (isScrollingRef): the flag
+        // that records "user panned away" is only written on gesture END, so a
+        // bar landing mid-drag used to yank the view back to the newest bar,
+        // fighting the user's pull toward history.
+        // Bars APPENDED at the right (the replay feed) move the last bar's
+        // time forward; bars PREPENDED by scrollback loading do not. The
+        // follow must only advance for appends: the prepend layout-effect
+        // already shifts the view for prepends, and advancing here too
+        // double-counted every scrollback page and dragged the view forward.
+        const lastTs = (candles[candles.length - 1] as any)?.timestamp
+          ?? (candles[candles.length - 1] as any)?.time;
+        const prevLastTs = prevReplayLastTsRef.current;
+        const lastAdvanced = prevLastTs !== null && lastTs !== prevLastTs;
+        prevReplayLastTsRef.current = lastTs;
+        // Count appends by TIMESTAMP (bars strictly newer than the previous
+        // last bar). Everything else in the length delta happened at the
+        // FRONT: prepends from scrollback (positive) or evictions
+        // (negative). netFront is EXACT by construction, which the old
+        // cross-component "prepend shift" ledger was not: its local-midnight
+        // bucket keying overcounted stock sessions that cross midnight in
+        // the server timezone, so every landed history page nudged the view
+        // a couple of bars forward while the user was swiping back.
+        let appended = 0;
+        if (prevLastTs !== null) {
+          const prevMs = new Date(prevLastTs as any).getTime();
+          for (let i = candles.length - 1; i >= 0 && appended < 100000; i--) {
+            const cts = (candles[i] as any).timestamp ?? (candles[i] as any).time;
+            if (new Date(cts).getTime() > prevMs) appended++;
+            else break;
+          }
+        }
+        // Front-compensated position: the same candles stay on screen after
+        // a prepend or eviction. Anchored by TIMESTAMP against the retained
+        // previous array, not by length arithmetic: partial-bucket evictions
+        // change the front bucket's contents without changing the count, so
+        // "length minus appends" was off by up to a bar per eviction and the
+        // parked view slowly drifted. The anchor bar is looked up in the new
+        // array by binary search; if it was itself evicted, the view pins to
+        // the oldest bar still loaded.
+        let base = Math.max(0, liveStartIndex);
+        const prevArr = prevReplayCandlesRef.current;
+        if (!isRefit && prevArr && prevArr.length > 0) {
+          const anchorIdx = Math.max(0, Math.min(Math.floor(liveStartIndex), prevArr.length - 1));
+          const a = prevArr[anchorIdx] as any;
+          const anchorMs = new Date(a.timestamp ?? a.time).getTime();
+          let lo = 0, hi = candles.length - 1, found = 0;
+          while (lo <= hi) {
+            const mid = (lo + hi) >>> 1;
+            const c = candles[mid] as any;
+            const ms = new Date(c.timestamp ?? c.time).getTime();
+            if (ms < anchorMs) { lo = mid + 1; found = lo; }
+            else { hi = mid - 1; found = mid; }
+          }
+          base = Math.max(0, found + (liveStartIndex - Math.floor(liveStartIndex)));
+        }
+        const netFront = Math.round(base - Math.max(0, liveStartIndex));
+        prevReplayCandlesRef.current = candles;
+        if (isRefit || (!isScrollingRef.current && latestCandleVisible && !replayUserScrolledRef.current && lastAdvanced)) {
+          // Refit recenters (latest at ~90%). A plain follow instead ADVANCES
+          // only as far as needed to keep the newest bar on screen: with the
+          // window full that is exactly `appended`; when the user has panned
+          // back and the bars end mid-screen, new bars paint into the empty
+          // right side without moving the view at all.
+          const overflowRight = Math.max(0, candles.length - Math.floor(base) - visibleCount);
+          const followBy = Math.min(appended, overflowRight);
+          const newStartIndex = isRefit
+            ? Math.max(0, candles.length - 1 - targetPosition)
+            : base + followBy;
+          setViewState(prev => ({ ...prev, candleWidth: width, startIndex: newStartIndex, autoFollowLatest: false }));
+          // Sync the scroll ref so the next gesture starts from this position
+          // instead of a stale pre-follow index.
+          scrollStateRef.current = { startIndex: newStartIndex, candleWidth: width };
+          // A held-but-paused drag (the 100ms idle commit drops isScrolling
+          // while the button is still down) computes its position from the
+          // mousedown anchor, so the anchor must move with the array too or
+          // the next movement snaps back by everything that landed during
+          // the pause.
+          if (!isRefit && isDragging && (netFront !== 0 || followBy > 0)) {
+            setDragStart(prev => ({ ...prev, startIndex: prev.startIndex + netFront + followBy }));
+          }
           // Reset user-scrolled flag on TF switch so play auto-follows again
           if (isTfSwitch) replayUserScrolledRef.current = false;
+        } else if (netFront !== 0) {
+          // No follow (user panned away, or a gesture is active), but the
+          // array still moved under the view: compensate so the same candles
+          // stay on screen.
+          setViewState(prev => ({ ...prev, startIndex: Math.max(0, prev.startIndex + netFront) }));
+          scrollStateRef.current.startIndex = Math.max(0, scrollStateRef.current.startIndex + netFront);
+          if (isDragging) {
+            setDragStart(prev => ({ ...prev, startIndex: prev.startIndex + netFront }));
+          }
         }
+        // The refit for this switch has been applied (or was unnecessary
+        // because the user had panned away); clear the latch either way.
+        if (isRefit) pendingTfRefitRef.current = false;
       }
       prevCandlesLengthRef.current = candles.length;
       return;
@@ -6970,7 +7122,7 @@ const ProChart: React.FC<ProChartProps> = ({
 
     setViewState(prev => ({ ...prev, startIndex }));
     prevCandlesLengthRef.current = candles.length;
-  }, [candles.length, dimensions.width, viewState.autoFollowLatest, viewState.candleWidth, viewState.futureSpace, disableAutoFollow]);
+  }, [candles.length, dimensions.width, viewState.autoFollowLatest, viewState.candleWidth, viewState.futureSpace, disableAutoFollow, timeframe]);
 
   // INFINITE SCROLLBACK: When prependShift increases, the parent has prepended older candles.
   // Shift viewState.startIndex by the delta so the user's visible view stays on the same
@@ -6978,14 +7130,13 @@ const ProChart: React.FC<ProChartProps> = ({
   // happens BEFORE the browser paints, eliminating the ghost frame where the user would
   // briefly see the wrong candles before the view corrects itself.
   useLayoutEffect(() => {
-    const delta = prependShift - prevPrependShiftRef.current;
-    if (delta > 0) {
-      setViewState(prev => ({
-        ...prev,
-        startIndex: prev.startIndex + delta,
-      }));
-      scrollStateRef.current.startIndex += delta;
-    }
+    // View compensation for prepends/evictions no longer lives here: the
+    // replay follow effect derives the exact front delta from the candle
+    // array itself (netFront), because this ledger's bucket-count deltas
+    // proved inexact (local-midnight keying overcounts midnight-crossing
+    // stock sessions) and shifting by them crept the view forward on every
+    // landed history page. The prop still feeds the grid-anchor offsets in
+    // the draw code; only the ref bookkeeping remains here.
     prevPrependShiftRef.current = prependShift;
   }, [prependShift]);
 

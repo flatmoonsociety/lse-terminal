@@ -642,7 +642,12 @@ export async function fetchWindowedCandles(
         order: 'asc',
         end: cursor,
       });
-      const page = cursor ? rows.filter((r) => r.timestamp < cursor!) : rows;
+      // First page: inclusive of the lte bound, or a backtest anchored exactly
+      // on a bar open silently lost that bar. Later pages: strictly older than
+      // the oldest bar already taken, to guarantee progress.
+      const page = cursor
+        ? rows.filter((r) => (i === 0 ? r.timestamp <= cursor! : r.timestamp < cursor!))
+        : rows;
       if (!page.length) break;
       pages.push(page);
       total += page.length;

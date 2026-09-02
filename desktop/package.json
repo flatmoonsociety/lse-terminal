@@ -1,7 +1,7 @@
 {
   "name": "lse-terminal-desktop",
   "productName": "LSE Terminal",
-  "version": "0.0.1",
+  "version": "0.0.13",
   "description": "LSE Terminal desktop app: local backtesting on the Brue engine",
   "main": "main.js",
   "author": "London Strategic Edge",
@@ -65,6 +65,10 @@
       "icon": "build/icon.ico",
       "signtoolOptions": {
         "sign": "./sign-windows.js",
+        "publisherName": [
+          "CN=London Strategic Edge, O=London Strategic Edge, L=London, C=GB",
+          "London Strategic Edge"
+        ],
         "signingHashAlgorithms": [
           "sha256"
         ]

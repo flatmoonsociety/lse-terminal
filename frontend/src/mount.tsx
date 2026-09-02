@@ -1233,7 +1233,12 @@ function ManualBacktestRoute({ provider }: { provider: string }) {
   const location = useLocation();
   const sym = searchParams.get('sym');
   const pair = location.pathname.split('/').pop() || '';
-  setEngineContext({ provider, symbol: sym || pair });
+  // The setup dialog can pick a source other than the shell's active provider
+  // (its Data Source selector), so the chosen provider rides in the URL and
+  // wins over the mount default; the fetch layer must read candles from the
+  // same source the pair was chosen from.
+  const replayProvider = searchParams.get('provider') || provider;
+  setEngineContext({ provider: replayProvider, symbol: sym || pair });
   useEffect(() => {
     btNav.inReplay = true;
     return () => { btNav.inReplay = false; };

@@ -179,9 +179,10 @@ export const BacktestMultiChart = ({
         replayTimestamp={replayTimestamp}
         onScrollSync={onScrollSync}
         drawings={drawings}
-        // RightToolbar is now rendered in the backtester (Backtesting.tsx),
-        // so we omit rightOffset to let ProChart use its default (48px toolbar gap),
-        // matching the live chart layout exactly.
+        // No RightToolbar in the terminal backtester (it was window-fixed and
+        // painted over the AI rail), so collapse the site's 48px toolbar gap
+        // to the same 6px breathing margin the terminal live chart uses.
+        rightOffset={6}
       />
     );
   }
@@ -268,8 +269,9 @@ export const BacktestMultiChart = ({
                 onCrosshairMove={syncCrosshair ? (price, time) => handleCrosshairMove(panel.id, time) : undefined}
                 syncedCrosshairTime={syncCrosshair && crosshairSourceRef.current !== panel.id ? crosshairTime : undefined}
                 onScrollSync={isSelected ? onScrollSync : undefined}
-                // RightToolbar is now in the backtester, so omit rightOffset
-                // to use default 48px toolbar gap, matching live chart layout.
+                // Same as the 1x1 path: no toolbar strip in the terminal, so
+                // the 48px gap collapses to the terminal's 6px margin.
+                rightOffset={6}
                 drawings={isSelected ? drawings : undefined}
               />
               

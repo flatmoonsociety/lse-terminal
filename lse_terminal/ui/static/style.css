@@ -678,6 +678,8 @@ html:not(.dark) #inq-actions button:hover { background: #cfd3d9; border-color: #
 .cs-bmeta { font: 10.5px var(--mono); color: var(--dim); }
 .cs-note { font-size: 11px; color: var(--dim); line-height: 1.4;
   font-style: italic; }
+.cs-support { font-size: 11px; color: var(--dim); text-decoration: underline;
+  align-self: flex-start; }
 .cs-form { display: flex; flex-direction: column; gap: 7px; }
 .cs-form label { display: flex; flex-direction: column; gap: 3px;
   color: var(--dim); font-size: 10.5px; text-transform: uppercase;
@@ -1680,7 +1682,12 @@ html:not(.dark) .air-menu-item.on.sel { background: #c6cad1; }
 .stat .v.pos { color: var(--up); } .stat .v.neg { color: var(--down); }
 #bt-equity-label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
 #bt-equity { flex: 1; min-height: 0; }
-.hidden { display: none !important; }
+/* Shell-only visibility toggle. Scoped away from the React mounts (#chart,
+   #manual-backtest): the chart bundle uses Tailwind's own `hidden sm:flex`
+   responsive pattern, and this global !important rule was overriding the
+   sm: media variant, permanently hiding the backtest toolbar clusters
+   (speed, timeframes, limit orders) at every width. */
+.hidden:not(:is(#chart, #chart-pro, #manual-backtest) *) { display: none !important; }
 
 /* ECONOMIC CALENDAR: React page fills the section like manual backtest */
 #econcal { flex: 1; min-width: 0; min-height: 0; }

@@ -40,3 +40,4 @@ def set_lse_api_key(key: str) -> None:
     cfg = load()
     cfg["lse_api_key"] = key.strip()
     save(cfg)
+

@@ -91,24 +91,84 @@ echo "smoke OK"
 echo "== electron app (dmg + zip)"
 cd "$DESK"
 npm install
-# Release channel. LSE_CHANNEL=dev builds an INTERNAL app whose updater reads
-# an internal release channel instead of the public one, so a build can be
-# exercised on the dev channel before it is promoted to the public feed. The
-# channel URL and token come from ~/.private_keys/devfeed.env (DEV_FEED_URL,
-# DEV_FEED_TOKEN), never the repo; the token is sent as a request header whose
-# value must contain no space (electron-builder's command line splits the
-# value at the space and drops the secret).
+# Release channel. LSE_CHANNEL=demo builds LSE DEMO TERMINAL, a separate app
+# (own name, bundle id, updater cache and config folder) that installs next
+# to the public LSE Terminal and updates from the private shelf's demo/
+# subfolder, so changes are exercised there before they are promoted to the
+# public feed. The shelf URL and token come from ~/.private_keys/devfeed.env
+# (DEV_FEED_URL, DEV_FEED_TOKEN), never the repo; the token is sent as a
+# request header whose value must contain no space (electron-builder's
+# command line splits the value at the space and drops the secret). "dev" is
+# the old name for demo.
 EB_ARGS=()
-if [ "${LSE_CHANNEL:-}" = "dev" ]; then
-  DEVFEED="$HOME/.private_keys/devfeed.env"
-  [ -f "$DEVFEED" ] || { echo "LSE_CHANNEL=dev needs $DEVFEED" >&2; exit 1; }
-  # shellcheck disable=SC1090
-  . "$DEVFEED"
-  EB_ARGS+=("-c.publish.url=$DEV_FEED_URL" "-c.publish.requestHeaders.X-LSE-Feed=$DEV_FEED_TOKEN")
-  echo "   channel: dev (private shelf)"
-else
-  echo "   channel: public"
+case "${LSE_CHANNEL:-public}" in
+  dev|demo)
+    DEVFEED="$HOME/.private_keys/devfeed.env"
+    [ -f "$DEVFEED" ] || { echo "LSE_CHANNEL=demo needs $DEVFEED" >&2; exit 1; }
+    # shellcheck disable=SC1090
+    . "$DEVFEED"
+    FEED="${DEV_FEED_URL%/}/demo/"
+    EB_ARGS+=("-c.productName=LSE Demo Terminal"
+              "-c.appId=com.londonstrategicedge.terminal.demo"
+              '-c.mac.artifactName=LSE Demo Terminal ${version} ${arch}.${ext}'
+              "-c.extraMetadata.name=lse-demo-terminal-desktop"
+              "-c.extraMetadata.productName=LSE Demo Terminal"
+              "-c.extraMetadata.lseChannel=demo"
+              "-c.publish.url=$FEED"
+              "-c.publish.requestHeaders.X-LSE-Feed=$DEV_FEED_TOKEN")
+    echo "   channel: demo (LSE Demo Terminal, private shelf demo/)"
+    ;;
+  *) echo "   channel: public" ;;
+esac
+# Headless signing. codesign reaches the Developer ID that lives in the login
+# keychain only from the machine's own GUI session; driven over ssh the
+# keychain answers "User interaction is not allowed" and every sign dies with
+# errSecInternalComponent, after the whole app has already been packaged.
+# find-identity still LISTS the identity in that session, so listing it proves
+# nothing; only an actual sign does. When a real sign fails that way and the CI
+# credential bundle is on the machine, import the same identity into a
+# throwaway keychain this shell unlocks itself (what CI does) and drop it again
+# on exit. A GUI build probes clean and skips all of this.
+CI_SECRETS="$HOME/.private_keys/ci-secrets.txt"
+can_sign_here() {
+  local d rc
+  d="$(mktemp -d)"
+  cp /usr/bin/true "$d/probe" 2>/dev/null || { rm -rf "$d"; return 1; }
+  codesign --sign "Developer ID Application" --force "$d/probe" >/dev/null 2>&1
+  rc=$?
+  rm -rf "$d"
+  return $rc
+}
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application" \
+   && ! can_sign_here && [ -f "$CI_SECRETS" ]; then
+  P12B64="$(sed -n 's/^APPLE_CERT_P12_BASE64=//p' "$CI_SECRETS")"
+  P12PW="$(sed -n 's/^APPLE_CERT_PASSWORD=//p' "$CI_SECRETS")"
+  if [ -n "$P12B64" ] && [ -n "$P12PW" ]; then
+    echo "   login keychain unusable from this session: temporary build keychain"
+    KCPW="$(openssl rand -hex 16)"
+    P12F="$(mktemp)"
+    printf '%s' "$P12B64" | base64 -d > "$P12F"
+    security delete-keychain lse-build.keychain >/dev/null 2>&1 || true
+    security create-keychain -p "$KCPW" lse-build.keychain
+    # no auto-relock: a long notarize wait must not lock the key mid-build
+    security set-keychain-settings -lut 21600 lse-build.keychain
+    security unlock-keychain -p "$KCPW" lse-build.keychain
+    security import "$P12F" -k lse-build.keychain -P "$P12PW" -f pkcs12 \
+      -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+    rm -f "$P12F"
+    # without the partition list every sign raises a UI prompt that a headless
+    # session cannot answer, which is the same dead end by another route
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" \
+      lse-build.keychain >/dev/null 2>&1
+    # search order decides which keychain codesign picks; ours must come first
+    security list-keychains -d user -s lse-build.keychain login.keychain
+    export CSC_KEYCHAIN="$HOME/Library/Keychains/lse-build.keychain-db"
+    trap 'security list-keychains -d user -s login.keychain >/dev/null 2>&1;
+          security delete-keychain lse-build.keychain >/dev/null 2>&1' EXIT
+    can_sign_here || { echo "temporary build keychain still cannot sign" >&2; exit 1; }
+  fi
 fi
+
 # Sign + notarize when the machine carries the Developer ID identity AND an
 # App Store Connect API key (notarytool); otherwise build unsigned so a Mac
 # without the credentials still produces a testable dmg (first launch then

@@ -9,12 +9,14 @@
 # Signing when %USERPROFILE%\.lse-signing\signing.env exists, else the
 # installer ships unsigned (SmartScreen prompt). Nothing to pass here.
 #
-# Channel: -Channel dev builds an INTERNAL app whose updater reads a private
-# token-gated feed configured by %USERPROFILE%\.lse-signing\devfeed.env
-# (DEV_FEED_URL, DEV_FEED_TOKEN), never the repo; the default builds the
-# public app.
+# Channel: -Channel demo builds LSE DEMO TERMINAL, a separate app (own name,
+# app id, install folder, updater cache and config folder) that installs next
+# to the public LSE Terminal and updates from the private token-gated shelf's
+# demo/ subfolder, configured by %USERPROFILE%\.lse-signing\devfeed.env
+# (DEV_FEED_URL, DEV_FEED_TOKEN), never the repo. Changes land in the demo app
+# first; the default builds the public app. "dev" is the old name for demo.
 param(
-  [ValidateSet("public", "dev")] [string] $Channel = "public",
+  [ValidateSet("public", "dev", "demo")] [string] $Channel = "public",
   [string] $Python = "python"
 )
 $ErrorActionPreference = "Stop"
@@ -63,14 +65,32 @@ Write-Host "== electron app (nsis)"
 Set-Location $Desk
 npm install
 $ebArgs = @("--win")
-if ($Channel -eq "dev") {
+if ($Channel -eq "dev") { $Channel = "demo" }
+if ($Channel -eq "demo") {
   $devfeed = Join-Path $env:USERPROFILE ".lse-signing\devfeed.env"
-  if (-not (Test-Path $devfeed)) { throw "-Channel dev needs $devfeed" }
+  if (-not (Test-Path $devfeed)) { throw "-Channel demo needs $devfeed" }
   $kv = @{}
   Get-Content $devfeed | ForEach-Object { if ($_ -match "^([^=#]+)=(.*)$") { $kv[$matches[1].Trim()] = $matches[2].Trim() } }
-  $ebArgs += "-c.publish.url=$($kv['DEV_FEED_URL'])"
+  # A separate app, not a re-skin of the public one: its own product name
+  # (Start menu entry, install folder, taskbar), its own app id (own
+  # uninstall entry, so it never replaces a public install), its own package
+  # name (own updater cache), and a channel marker in package.json that the
+  # shell reads to give the engine its own config folder. The feed is the
+  # private shelf's demo/ subfolder so a demo build is never offered to a
+  # public install or to a machine following the shelf root.
+  $feed = $kv['DEV_FEED_URL'].TrimEnd('/') + '/demo/'
+  $ebArgs += '-c.productName=LSE Demo Terminal'
+  $ebArgs += '-c.appId=com.londonstrategicedge.terminal.demo'
+  $ebArgs += '-c.artifactName=LSE Demo Terminal Setup ${version}.${ext}'
+  $ebArgs += '-c.extraMetadata.name=lse-demo-terminal-desktop'
+  # Electron names its own data folder (and the single-instance lock) after
+  # package.json's top-level productName, which -c.productName leaves alone;
+  # without this the demo app locks the public app's folder and quits.
+  $ebArgs += '-c.extraMetadata.productName=LSE Demo Terminal'
+  $ebArgs += '-c.extraMetadata.lseChannel=demo'
+  $ebArgs += "-c.publish.url=$feed"
   $ebArgs += "-c.publish.requestHeaders.X-LSE-Feed=$($kv['DEV_FEED_TOKEN'])"
-  Write-Host "   channel: dev (private shelf)"
+  Write-Host "   channel: demo (LSE Demo Terminal, private shelf demo/)"
 } else {
   Write-Host "   channel: public"
 }

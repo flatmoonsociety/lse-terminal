@@ -338,10 +338,13 @@ export const api = {
   // Upstream this is a server-ranked RPC over the master symbol registry.
   // Locally the universe is whatever the active provider offers, served by
   // /api/instruments; ranking fields are filled with neutral values.
-  async smartSearch(opts: { q?: string; limit?: number; category?: string } = {}) {
+  async smartSearch(opts: { q?: string; limit?: number; category?: string; provider?: string } = {}) {
     const { getEngineContext } = await import('./localEngine');
+    // An explicit provider lets a caller (the manual-backtest source picker)
+    // search one source's universe without touching the shell's active chart
+    // provider; unset, it follows the active context as before.
     const params: Record<string, string> = {
-      provider: getEngineContext().provider,
+      provider: opts.provider || getEngineContext().provider,
       limit: String(opts.limit ?? 50),
     };
     if (opts.q) params.query = opts.q;

@@ -10,12 +10,24 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { CalendarIcon, Clock, Search } from "lucide-react";
 import { format, subMonths } from "date-fns";
 import { cn } from "@/lib/utils";
-import { useMarketData } from '@/hooks/useMarketData';
+import { getEngineContext } from "@/lib/localEngine";
 
 interface BacktestingSetupDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
+
+// A data source the manual backtest can replay: any non-broker provider that
+// can both list instruments and serve candles. "London Strategic Edge" is the
+// full hosted catalog (thousands of instruments, every timeframe); "My Data"
+// is the user's imported files. The picker offers whichever the engine reports
+// as configured, so a backtest is never silently limited to one source.
+interface DataSource { name: string; title: string; }
+
+// How many rows to render before the reveal sentinel loads more: the LSE
+// catalog is several thousand instruments, and mounting every one as a Radix
+// SelectItem locks the dialog for a second. Rows past this reveal on scroll.
+const PAIR_PAGE = 100;
 
 const TIMEFRAMES = [
   { value: "1m", label: "1 Minute" },
@@ -62,13 +74,39 @@ const TIMEZONES = [
 export default function BacktestingSetupDialog({ open, onOpenChange }: BacktestingSetupDialogProps) {
   const navigate = useNavigate();
 
-  // Load all catalog symbols via useMarketData; ranking comes from the search endpoint.
-  const { searchAssets } = useMarketData();
-  const assetBySymbol = useMemo(() => {
-    const map = new Map<string, typeof searchAssets[number]>();
-    for (const a of searchAssets) map.set(a.symbol, a);
-    return map;
-  }, [searchAssets]);
+  // ── Data source ────────────────────────────────────────────────────────
+  // The universe the picker lists and the replay pulls from. Defaults to the
+  // full LSE catalog when its key is configured (what a trader means by "pick
+  // any pair"), else to whatever the shell handed us. Switching source clears
+  // the pair, because a symbol from one source is meaningless in another.
+  const [sources, setSources] = useState<DataSource[]>([]);
+  const [source, setSource] = useState<string>(() => getEngineContext().provider || "userdata");
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    fetch("/api/providers")
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows: Array<{ name: string; title?: string; broker?: boolean; configured?: boolean; capabilities?: string[] }>) => {
+        if (!alive || !Array.isArray(rows)) return;
+        const usable = rows
+          .filter((p) => !p.broker && (p.capabilities || []).includes("search") && (p.capabilities || []).includes("candles"))
+          .map((p) => ({ name: p.name, title: p.title || p.name, configured: p.configured !== false }));
+        setSources(usable);
+        // Prefer LSE (the full catalog) when present AND configured; an
+        // unconfigured LSE (no key) has an empty catalog, and defaulting to
+        // it showed a fresh install "No pairs found" while My Data sat ready.
+        // Otherwise keep the engine's provider if usable, else the first
+        // CONFIGURED usable source.
+        setSource((cur) => {
+          const lse = usable.find((s) => s.name === "lse");
+          if (lse && lse.configured) return "lse";
+          if (usable.some((s) => s.name === cur && s.configured)) return cur;
+          return usable.find((s) => s.configured)?.name || usable[0]?.name || cur;
+        });
+      })
+      .catch(() => { /* offline: the shell's provider stands as the only source */ });
+    return () => { alive = false; };
+  }, [open]);
 
   const [selectedPair, setSelectedPair] = useState<string>("");
   const [selectedTimeframe, setSelectedTimeframe] = useState<string>("5m");
@@ -78,6 +116,15 @@ export default function BacktestingSetupDialog({ open, onOpenChange }: Backtesti
   const [startingCapital, setStartingCapital] = useState<string>("10000");
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [spread, setSpread] = useState<string>("0");
+  const [visibleCount, setVisibleCount] = useState<number>(PAIR_PAGE);
+
+  // A symbol only means something within its own source, so switching source
+  // clears the current pick and collapses the reveal window back to page one.
+  useEffect(() => {
+    setSelectedPair("");
+    setSearchQuery("");
+    setVisibleCount(PAIR_PAGE);
+  }, [source]);
 
   // Reset start date to 1 month before current date when dialog opens
   useEffect(() => {
@@ -102,40 +149,64 @@ export default function BacktestingSetupDialog({ open, onOpenChange }: Backtesti
     // `sym` carries the provider's native symbol ("EUR/USD") alongside the
     // slashless URL form: the terminal's data layer addresses instruments by
     // native symbol, and stripping the slash is not reversible.
-    navigate(`/backtest/${pairForUrl}?from=${fromDate}&time=${startTime}&tz=${encodeURIComponent(timezone)}&tf=${selectedTimeframe}&capital=${startingCapital}&spread=${spread}&sym=${encodeURIComponent(selectedPair)}`);
+    // `provider` pins the replay to the source this pair came from, so a pick
+    // from LSE never replays against My Data (or the reverse) after the shell's
+    // active provider has moved on.
+    navigate(`/backtest/${pairForUrl}?from=${fromDate}&time=${startTime}&tz=${encodeURIComponent(timezone)}&tf=${selectedTimeframe}&capital=${startingCapital}&spread=${spread}&provider=${encodeURIComponent(source)}&sym=${encodeURIComponent(selectedPair)}`);
     onOpenChange(false);
   };
 
-  // Server-ranked results from the search endpoint. Empty query returns curated Popular;
-  // non-empty query searches symbol + display_name + aliases with debouncing.
+  // Server-ranked results for the chosen source. An empty query lists the whole
+  // catalog (paged into the dropdown below); a query searches symbol +
+  // display_name + aliases with debouncing. limit is high on the empty query so
+  // "all pairs" really means all of them, not a curated twenty.
   const [rpcResults, setRpcResults] = useState<SmartSearchResult[]>([]);
   useEffect(() => {
     if (!open) return;
     const q = searchQuery.trim();
     const ctrl = new AbortController();
     const t = setTimeout(() => {
-      api.smartSearch({ q, limit: q ? 50 : 20 })
-        .then(rows => { if (!ctrl.signal.aborted) setRpcResults(rows); })
+      api.smartSearch({ q, provider: source, limit: q ? 50 : 5000 })
+        .then(rows => { if (!ctrl.signal.aborted) { setRpcResults(rows); setVisibleCount(PAIR_PAGE); } })
         .catch(() => { if (!ctrl.signal.aborted) setRpcResults([]); });
     }, q ? 120 : 0);
     return () => { ctrl.abort(); clearTimeout(t); };
-  }, [searchQuery, open]);
+  }, [searchQuery, open, source]);
 
-  const filteredPairs = useMemo(() => {
-    const out: { symbol: string; category: string; aliases: string[] }[] = [];
-    for (const r of rpcResults) {
-      const a = assetBySymbol.get(r.symbol);
-      if (!a) continue;
-      out.push({ symbol: a.symbol, category: a.category, aliases: [a.name.toLowerCase()] });
-    }
-    return out;
-  }, [rpcResults, assetBySymbol]);
+  // The search endpoint already carries display_name + category per row, so the
+  // list needs no second lookup: every returned instrument is offered, in the
+  // server's ranked/category order.
+  const filteredPairs = useMemo(
+    () => rpcResults.map((r) => ({
+      symbol: r.symbol,
+      name: r.display_name || r.symbol,
+      category: r.category || "Other",
+    })),
+    [rpcResults],
+  );
 
-  const groupedPairs = filteredPairs.reduce((acc, pair) => {
+  // Reveal-on-scroll sentinel: mounting thousands of SelectItems at once wedges
+  // the dialog, so only the first `visibleCount` render and more appear as the
+  // sentinel scrolls into view.
+  const [revealSentinel, setRevealSentinel] = useState<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!revealSentinel) return;
+    const obs = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) setVisibleCount((c) => c + PAIR_PAGE);
+    });
+    obs.observe(revealSentinel);
+    return () => obs.disconnect();
+  }, [revealSentinel, filteredPairs.length]);
+
+  const visiblePairs = filteredPairs.slice(0, visibleCount);
+  const remainingPairs = filteredPairs.length - visiblePairs.length;
+
+  // Group the visible slice by category, preserving the server's order.
+  const groupedPairs = visiblePairs.reduce((acc, pair) => {
     if (!acc[pair.category]) acc[pair.category] = [];
     acc[pair.category].push(pair);
     return acc;
-  }, {} as Record<string, { symbol: string; category: string; aliases: string[] }[]>);
+  }, {} as Record<string, { symbol: string; name: string; category: string }[]>);
 
   // ── Timeframes the chosen dataset can actually answer ──────────────────
   // The terminal backtests the user's OWN imported files, and a file has one
@@ -170,7 +241,10 @@ export default function BacktestingSetupDialog({ open, onOpenChange }: Backtesti
     const unit = m[2].toLowerCase();
     return n * (unit === 'm' ? 1 : unit === 'h' ? 60 : unit === 'd' ? 1440 : 10080);
   };
-  const nativeMinutes = selectedPair
+  // The one-native-resolution rule is a My Data fact (an imported file has a
+  // single timeframe); the LSE catalog serves every timeframe, so it never
+  // constrains the selector.
+  const nativeMinutes = selectedPair && source === "userdata"
     ? tfMinutes(nativeTf[selectedPair.toUpperCase()] || '')
     : 0;
   const tfDisabled = (tf: string) => nativeMinutes > 0 && tfMinutes(tf) < nativeMinutes;
@@ -202,6 +276,29 @@ export default function BacktestingSetupDialog({ open, onOpenChange }: Backtesti
         </DialogHeader>
 
         <div className="space-y-5 py-4">
+          {/* Data Source: which universe the picker lists and the replay reads.
+              Shown only when more than one source is configured; a single
+              source needs no choice. */}
+          {sources.length > 1 && (
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">
+                Data Source
+              </Label>
+              <Select value={source} onValueChange={setSource}>
+                <SelectTrigger className="glass border-border">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="glass-strong border-border">
+                  {sources.map((s) => (
+                    <SelectItem key={s.name} value={s.name}>
+                      {s.title}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+
           {/* Pair Selection with Search */}
           <div className="space-y-2">
             <Label className="text-sm font-medium">
@@ -235,18 +332,29 @@ export default function BacktestingSetupDialog({ open, onOpenChange }: Backtesti
                     No pairs found
                   </div>
                 ) : (
-                  Object.entries(groupedPairs).map(([category, pairs]) => (
-                    <div key={category}>
-                      <div className="px-2 py-1.5 text-xs font-semibold text-text-secondary uppercase tracking-wider">
-                        {category}
+                  <>
+                    {Object.entries(groupedPairs).map(([category, pairs]) => (
+                      <div key={category}>
+                        <div className="px-2 py-1.5 text-xs font-semibold text-text-secondary uppercase tracking-wider">
+                          {category}
+                        </div>
+                        {pairs.map((pair) => (
+                          <SelectItem key={pair.symbol} value={pair.symbol}>
+                            <span className="flex items-center gap-2 w-full min-w-0">
+                              <span className="font-medium shrink-0">{pair.symbol}</span>
+                              <span className="text-muted-foreground text-xs truncate">{pair.name}</span>
+                            </span>
+                          </SelectItem>
+                        ))}
                       </div>
-                      {pairs.map((pair) => (
-                        <SelectItem key={pair.symbol} value={pair.symbol}>
-                          {pair.symbol}
-                        </SelectItem>
-                      ))}
-                    </div>
-                  ))
+                    ))}
+                    {/* Reveals the next page as it scrolls into view. */}
+                    {remainingPairs > 0 && (
+                      <div ref={setRevealSentinel} aria-hidden className="h-6 text-center text-[11px] text-muted-foreground pt-1">
+                        Loading {remainingPairs} more...
+                      </div>
+                    )}
+                  </>
                 )}
               </SelectContent>
             </Select>

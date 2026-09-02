@@ -51,7 +51,6 @@ import { getDisplayConfig } from "@/lib/contractSpecs";
 import { useMarketData } from "@/hooks/useMarketData";
 import { calculatePriceAxisWidth } from "@/lib/utils";
 import { useAuth } from "@/contexts/AuthContext";
-import RightToolbar from "@/components/chart/RightToolbar";
 import { useChartSettings } from '@/contexts/ChartSettingsContext';
 
 const BACKTEST_SESSION_KEY = 'lse_backtest_session';
@@ -246,8 +245,44 @@ const Backtesting = () => {
   const initialTimeframe = searchParams.get("tf") || "5m";
   const startingCapital = searchParams.get("capital") || "10000";
   const spreadPips = parseFloat(searchParams.get("spread") || "0");
+  const replayProvider = searchParams.get("provider") || "";
+  const replaySymbol = searchParams.get("sym") || "";
+
+  // An imported dataset only serves its native timeframe and coarser
+  // multiples; the engine refuses finer ones. The toolbar used to offer the
+  // full ladder anyway: clicking 5m on a 1h-native import highlighted 5m
+  // while the chart silently kept showing 1h bars. Hide what cannot be
+  // served, and bump the selection if the URL asked for a finer one.
+  const [nativeTfMinutes, setNativeTfMinutes] = useState(0);
+  useEffect(() => {
+    if (replayProvider !== "userdata") { setNativeTfMinutes(0); return; }
+    let alive = true;
+    fetch("/api/data")
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows: Array<{ symbol: string; timeframe?: string | null }>) => {
+        if (!alive || !Array.isArray(rows)) return;
+        const key = (replaySymbol || pair || "").toUpperCase();
+        const entry = rows.find((e) => (e.symbol || "").toUpperCase() === key);
+        const tf = (entry?.timeframe || "").toLowerCase();
+        const mins: Record<string, number> = { "1s": 1 / 60, "30s": 0.5, "1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080 };
+        setNativeTfMinutes(mins[tf] || 0);
+      })
+      .catch(() => { /* offline: keep the full ladder */ });
+    return () => { alive = false; };
+  }, [replayProvider, replaySymbol, pair]);
+  const servableTimeframes = useMemo(
+    () => (nativeTfMinutes > 0 ? timeframes.filter((tf) => TF_MINUTES[tf] >= nativeTfMinutes) : timeframes),
+    [nativeTfMinutes],
+  );
 
   const [selectedTimeframe, setSelectedTimeframe] = useState(initialTimeframe);
+  // Selection clamp for the imported-data ladder above: a URL or restored
+  // session can carry a timeframe the dataset cannot serve.
+  useEffect(() => {
+    if (nativeTfMinutes > 0 && TF_MINUTES[selectedTimeframe] < nativeTfMinutes && servableTimeframes.length) {
+      setSelectedTimeframe(servableTimeframes[0]);
+    }
+  }, [nativeTfMinutes, selectedTimeframe, servableTimeframes]);
   const [showIndicatorSettings, setShowIndicatorSettings] = useState(false);
   const [showChartSettings, setShowChartSettings] = useState(false);
   // chartSettings now comes from ChartSettingsContext (was localStorage).
@@ -500,9 +535,24 @@ const Backtesting = () => {
     const realMsPerCandle = 250 / playbackSpeed;
     let accumulator = 0;
     let lastFrameTime = performance.now();
-    let currentIndex = findCandleIndex(timestamps, new Date(effectiveReplayTimestamp).getTime());
+    // Track the replay position by TIMESTAMP, never by a cached index: the
+    // raw array MUTATES under this loop (scrollback prepends insert 5001
+    // bars at the front, eviction drops bars). A cached index into it
+    // silently pointed 5001 bars earlier after every prepend, so a
+    // timeframe switch mid-play (whose refit triggers history backfill)
+    // marched the replay clock BACKWARD about 12 days per landed page.
+    let currentTsMs = new Date(effectiveReplayTimestamp).getTime();
     let stopped = false;
     let rafId: number;
+    // Starvation handling: the initial window loads only UP TO the start
+    // date, and the forward page arrives asynchronously. Stopping the
+    // moment the clock hits the loaded end killed playback on the very
+    // first Play click (the user had to press Play twice, the second time
+    // after the page had landed). Starvation now HOLDS at the last bar and
+    // resumes when data arrives; it only stops for real at the session's
+    // `to` bound, or after a long stretch with no new bars at all.
+    let starvedSinceMs = 0;
+    const sessionEndMs = new Date(`${toDate}T23:59:59Z`).getTime();
 
     const tick = (now: number) => {
       if (stopped) return;
@@ -512,21 +562,33 @@ const Backtesting = () => {
 
       const candlesToAdvance = Math.floor(accumulator / realMsPerCandle);
       if (candlesToAdvance > 0) {
-        accumulator -= candlesToAdvance * realMsPerCandle;
-        currentIndex += candlesToAdvance;
-
-        // Use fresh timestamps ref in case data has updated
+        // Use fresh timestamps ref in case data has updated, and re-derive
+        // the index from the timestamp EVERY advance so array mutations
+        // between ticks cannot move the clock.
         const ts = candleTimestampsRef.current;
+        let currentIndex = findCandleIndex(ts, currentTsMs) + candlesToAdvance;
 
-        // Clamp to end of data
         if (currentIndex >= ts.length) {
-          currentIndex = ts.length - 1;
-          setCurrentReplayTimestamp(ts[currentIndex]);
-          setIsPlaying(false);
-          stopped = true;
+          const lastMs = new Date(ts[ts.length - 1]).getTime();
+          if (lastMs >= sessionEndMs || (starvedSinceMs && now - starvedSinceMs > 12000)) {
+            // True end of the session (or nothing more ever came): stop.
+            currentTsMs = lastMs;
+            setCurrentReplayTimestamp(ts[ts.length - 1]);
+            setIsPlaying(false);
+            stopped = true;
+            return;
+          }
+          // Waiting for the forward loader: hold position, drop the backlog
+          // so arrival does not fast-forward, and keep ticking.
+          if (!starvedSinceMs) starvedSinceMs = now;
+          accumulator = 0;
+          rafId = requestAnimationFrame(tick);
           return;
         }
+        starvedSinceMs = 0;
+        accumulator -= candlesToAdvance * realMsPerCandle;
 
+        currentTsMs = new Date(ts[currentIndex]).getTime();
         setCurrentReplayTimestamp(ts[currentIndex]);
       }
 
@@ -992,16 +1054,26 @@ const Backtesting = () => {
 
 
 
+  // h-full min-h-0 on the provider: its default wrapper only has min-h-svh,
+  // which is not a definite height, so every h-full below it resolved to auto
+  // and the chart column froze at its first-measured pixel height. Maximizing
+  // the window then left a dead band under the chart (and small windows
+  // overflowed past the pane). A definite 100% keeps the chain live.
   return (
-    <SidebarProvider defaultOpen={false}>
+    <SidebarProvider defaultOpen={false} className="h-full min-h-0">
       {/* Explicit viewport heights: subtract TopNav on sm/md, full viewport
           on lg+ where TopNav is hidden via desktop chart mode. */}
-      <div className="relative h-[calc(100dvh-3.5rem)] md:h-[calc(100vh-3.5rem)] lg:h-screen w-full bg-bg flex flex-col overflow-hidden" style={{ touchAction: 'none', overscrollBehavior: 'none' }}>
+      {/* h-full, not h-screen: this page mounts inside the shell's #manual-backtest
+          pane, which starts below the terminal header. Sizing to the viewport made
+          the chart overflow the pane by exactly the header height, cutting off the
+          time axis at the bottom. The pane owns the height; fill it. */}
+      <div className="relative h-full w-full bg-bg flex flex-col overflow-hidden" style={{ touchAction: 'none', overscrollBehavior: 'none' }}>
         <div className="quantum-grid" />
-        {/* RightToolbar: same 48px fixed toolbar as the live chart, ensures
-            chartBounds.priceAxisWidth (110 = 62 base + 48 toolbar) matches
-            the actual layout so Y-axis badges and click rejection zones align. */}
-        <RightToolbar currentSymbol={pair} />
+        {/* No RightToolbar here: it is `fixed right-0` (window-anchored), so
+            inside the shell it rendered OVER the AI rail at the window edge as
+            a detached icon strip, while the chart still reserved a 48px gap
+            for it next to the axis. Same treatment as the terminal live chart
+            (mount.tsx): drop the strip, collapse the gap via rightOffset. */}
 
         {/* Header - Professional flat toolbar */}
         <div className="z-30 w-full bg-bg border-b border-border">
@@ -1135,7 +1207,7 @@ const Backtesting = () => {
               const nextIdx = Math.min(timestamps.length - 1, currentIdx + stepSize);
               setCurrentReplayTimestamp(timestamps[nextIdx]);
             }}
-            timeframes={timeframes}
+            timeframes={servableTimeframes}
             selectedTimeframe={selectedTimeframe}
             onTimeframeChange={handleTimeframeChange}
             dateRangeLabel={fromDate && toDate ? `${format(parseISO(fromDate), "MMM dd")} - ${format(parseISO(toDate), "MMM dd")}` : undefined}
@@ -1188,7 +1260,7 @@ const Backtesting = () => {
                 onToolSelect={setActiveTool}
                 converter={converter}
                 className="absolute inset-0 z-50"
-                chartBounds={{ priceAxisWidth: (converter as any).priceAxisWidth || calculatePriceAxisWidth(window.innerWidth < 500, pair || undefined, currentPrice || undefined), timeAxisHeight: window.innerWidth >= 1024 ? 28 : 24 }}
+                chartBounds={{ priceAxisWidth: (converter as any).priceAxisWidth || calculatePriceAxisWidth(window.innerWidth < 500, pair || undefined, currentPrice || undefined, 6), timeAxisHeight: window.innerWidth >= 1024 ? 28 : 24 }}
                 selectedDrawingId={selectedDrawingId}
                 onSelectDrawing={(id, position) => {
                   setSelectedDrawingId(id);
@@ -1410,11 +1482,17 @@ const Backtesting = () => {
                 onMouseLeave={() => setDraggingLine(null)}
                 onTouchEnd={() => setDraggingLine(null)}
               >
-                {/* SL/TP drag zones + lines, clipped so lines never bleed into Y-axis */}
+                {/* SL/TP drag zones + lines, clipped so lines never bleed into
+                    the Y-axis. The clip must be the chart's OWN axis width, not
+                    a hardcoded viewport guess: the old 112/88/75 was read from
+                    window.innerWidth at render time, so a small-window session
+                    maximized to full screen kept the small clip and the dashed
+                    lines ran into the price axis. converter.priceAxisWidth is
+                    recomputed on every chart resize, so this stays in step. */}
                 {multiLayout === "1x1" && converter && (
                   <div
                     className="absolute inset-0 overflow-hidden pointer-events-none"
-                    style={{ right: window.innerWidth >= 1024 ? 112 : (window.innerWidth < 500 ? 75 : 88) }}
+                    style={{ right: (converter as any).priceAxisWidth || 112 }}
                   >
                     <SlTpDragLines
                       converter={converter}
@@ -1430,7 +1508,9 @@ const Backtesting = () => {
                 )}
 
                 {/* Apply/Cancel buttons */}
-                <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex gap-2 pointer-events-auto">
+                {/* bottom-20, not bottom-4: the chart draws its zoom/paging cluster
+                    at the bottom center, and the two button rows overlapped. */}
+                <div className="absolute bottom-20 left-1/2 -translate-x-1/2 flex gap-2 pointer-events-auto">
                   <Button
                     size="sm"
                     onClick={handleApplySlTp}
@@ -1517,7 +1597,7 @@ const Backtesting = () => {
 
             {/* Apply/Cancel buttons for multi-panel SL/TP editing */}
             {multiLayout !== "1x1" && activeSlTpTradeId && (
-              <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 flex gap-2">
+              <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-30 flex gap-2">
                 <Button
                   size="sm"
                   onClick={handleApplySlTp}

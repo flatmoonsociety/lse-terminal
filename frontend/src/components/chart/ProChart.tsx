@@ -7531,12 +7531,16 @@ const ProChart: React.FC<ProChartProps> = ({
   // briefly see the wrong candles before the view corrects itself.
   useLayoutEffect(() => {
     const delta = prependShift - prevPrependShiftRef.current;
-    if (delta > 0) {
+    // Negative delta = the parent EVICTED candles from the front (the backtest
+    // forward loader's memory cap). The indexes of everything still loaded moved
+    // down by |delta|, so the view must move with them or it silently drifts
+    // forward by the evicted count. Same math as prepend, opposite sign.
+    if (delta !== 0) {
       setViewState(prev => ({
         ...prev,
-        startIndex: prev.startIndex + delta,
+        startIndex: Math.max(0, prev.startIndex + delta),
       }));
-      scrollStateRef.current.startIndex += delta;
+      scrollStateRef.current.startIndex = Math.max(0, scrollStateRef.current.startIndex + delta);
       // #GHOST-FIX-DO-NOT-REVERT - also compensate paintedScrollStateRef.
       // It only updates at the end of drawChart, but a prepend shifts every candle's
       // index by `delta` BEFORE the next drawChart can fire. Without this, the SVG
@@ -7545,7 +7549,7 @@ const ProChart: React.FC<ProChartProps> = ({
       // delta*candleSpacing pixels off for one paint, producing a single-frame
       // ghost roughly every time loadMoreHistory triggers (~every few seconds of
       // sustained scrollback through history).
-      paintedScrollStateRef.current.startIndex += delta;
+      paintedScrollStateRef.current.startIndex = Math.max(0, paintedScrollStateRef.current.startIndex + delta);
     }
     prevPrependShiftRef.current = prependShift;
   }, [prependShift]);

@@ -987,7 +987,7 @@ def create_app() -> FastAPI:
         is the default: the user's own history is the point, and the engine
         applies the from/to window itself, including the one bar past `to`
         it needs to flatten an open trade). A positive limit caps the load.
-        Remote providers keep a 50k ceiling, and get the window passed
+        Remote providers keep a 100k ceiling, and get the window passed
         down so a range older than the newest bars is served instead of
         being cut off by the cap (the old 2000-bar default loaded the newest
         bars, then found nothing inside an older window)."""
@@ -997,7 +997,7 @@ def create_app() -> FastAPI:
         lim = int(body.limit or 0)
         local = body.provider == "userdata"
         if lim <= 0:
-            lim = 0 if local else 50000
+            lim = 0 if local else 100_000
         else:
             lim = min(lim, 1_000_000)
         start = end = None
@@ -3305,7 +3305,9 @@ def create_app() -> FastAPI:
                     start=args.get("start") or None,
                     end=args.get("to") or args.get("end") or None,
                     features=args.get("features") or None)
-            except ValueError as e:
+            # NotSupported = timeframe finer than the import; tell the
+            # assistant plainly so it retries at the native resolution.
+            except (ValueError, NotSupported) as e:
                 raise HTTPException(400, str(e))
             return _json.dumps(entry)
         if name == "run_ml_blueprint":
@@ -3426,7 +3428,7 @@ def create_app() -> FastAPI:
                        # ~375-bar OOS slices, shorter than a 200-bar MA
                        # warmup). Same ceiling as run_backtest now; the
                        # combo guard below keeps the CPU bill bounded.
-                       "limit": min(int(args.get("bars") or 2000), 50000),
+                       "limit": min(int(args.get("bars") or 2000), 100_000),
                        "options": options}
             if name == "run_montecarlo":
                 path = "/api/backtest/montecarlo"
@@ -4873,7 +4875,9 @@ def create_app() -> FastAPI:
                 body.name, body.source, timeframe=body.timeframe,
                 bars=body.bars, start=body.start or None,
                 end=body.end or None, features=body.features or None)
-        except ValueError as e:
+        # NotSupported (e.g. a daily import asked for 1h) is a caller
+        # mistake, not an engine fault; 502 buried it in "build failed".
+        except (ValueError, NotSupported) as e:
             raise HTTPException(400, str(e))
         except Exception as e:
             raise HTTPException(502, f"dataset build failed: {e}")
@@ -6440,7 +6444,7 @@ def create_app() -> FastAPI:
                         run_opts["commission_pct"] = cost_pct
                     try:
                         candles = reg.get("userdata").candles(sym, tf,
-                                                              limit=50000)
+                                                              limit=100_000)
                         res = reg.engine("python").run(
                             script, candles, sym, tf, options=run_opts,
                             data_files=_resolve_datasets([]))

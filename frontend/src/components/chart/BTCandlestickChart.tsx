@@ -272,6 +272,13 @@ const ProCandlestickChart = ({
   // Chart loads 1K -> 5K -> 10K progressively, then fetches 5K more chunks on demand
   // as the user scrolls back through history, up to 100K candles total.
   const [isLoadingMoreHistory, setIsLoadingMoreHistory] = useState(false);
+  // The prepend-shift bucket math must use the timeframe at the moment the
+  // fetched page LANDS, not the one captured when the fetch launched: a page
+  // in flight across a timeframe switch used to compute its shift in the old
+  // timeframe's buckets (5001 one-minute bars is ~1000 5m buckets but ~3
+  // daily buckets) and blow the new view's startIndex out of the array.
+  const shiftTimeframeRef = useRef(timeframe);
+  shiftTimeframeRef.current = timeframe;
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   // Cumulative count of candles prepended by loadMoreHistory. Passed to ProChart
   // so it can shift viewState.startIndex by the delta to keep the view stable.
@@ -355,10 +362,36 @@ const ProCandlestickChart = ({
         setHasMoreData(false);
       } else {
         loadMoreRetryRef.current = 0; // Reset retry counter on success
-        setRawCandles(prev => {
-          const combined = [...prev, ...newCandles];
-          return combined.length > MAX_RAW_CANDLES ? combined.slice(combined.length - MAX_RAW_CANDLES) : combined;
-        });
+        // Computed from the closure value (rawCandles is in this callback's deps),
+        // not a functional updater: the eviction accounting below is a side effect
+        // and must run exactly once, while React may re-invoke updaters.
+        const combined = [...rawCandles, ...newCandles];
+        let next = combined;
+        if (combined.length > MAX_RAW_CANDLES) {
+          const kept = combined.slice(combined.length - MAX_RAW_CANDLES);
+          const evicted = combined.slice(0, combined.length - MAX_RAW_CANDLES);
+          // Evicting from the front moves every remaining candle's index down, so
+          // the prepend-shift ledger ProChart follows must move down by the same
+          // number of RENDERED candles or the viewport silently drifts forward
+          // after the user scrolled back. Same display-bucket keying as the
+          // scrollback prepend in loadMoreHistory; the seam bucket survives in the
+          // kept range so it is not counted.
+          const tfMin = timeframeToMinutes(timeframe);
+          if (tfMin > 0 && kept.length > 0) {
+            const bucketKey = (iso: string) => {
+              const d = new Date(iso);
+              return tfMin >= 1440
+                ? new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+                : Math.floor(d.getTime() / (tfMin * 60_000)) * (tfMin * 60_000);
+            };
+            const gone = new Set<number>();
+            for (const c of evicted) gone.add(bucketKey(c.timestamp));
+            gone.delete(bucketKey(kept[0].timestamp));
+            if (gone.size > 0) setHistoryPrependShift(p => Math.max(0, p - gone.size));
+          }
+          next = kept;
+        }
+        setRawCandles(next);
       }
     } catch (err) {
       console.error('[Backtest] Error loading more candles:', err);
@@ -370,7 +403,7 @@ const ProCandlestickChart = ({
     } finally {
       setIsLoadingMore(false);
     }
-  }, [pair, startDate, rawCandles, isLoadingMore, hasMoreData]);
+  }, [pair, startDate, rawCandles, timeframe, isLoadingMore, hasMoreData]);
 
   // INFINITE SCROLLBACK: Fetches 5K older candles when user scrolls to the left edge.
   // Called by ProChart via onLoadMore callback when startIndex < 50.
@@ -378,9 +411,72 @@ const ProCandlestickChart = ({
   // Prepends results to the candles array; ProChart detects the prepend and shifts viewState
   // so the visible chart doesn't jump. Stops at MAX_HISTORY_CANDLES (100K).
   const loadMoreHistory = useCallback(async () => {
-    // Guard: skip if already loading, no more data, in backtesting mode, background phase-2
+    // Guard: skip if already loading, no more data, background phase-2
     // still running, or no info about which data source to query
-    if (isLoadingMoreHistory || !hasMoreHistory || startDate || isBackgroundLoading) return;
+    if (isLoadingMoreHistory || !hasMoreHistory || isBackgroundLoading) return;
+
+    // BACKTEST MODE: scrolling to the left edge loads older bars into rawCandles.
+    // This was fully disabled (early return on startDate), which left the replay
+    // window as a hard wall: the user could not scroll back past the initially
+    // loaded history to analyse what came before. Prepend a page of older bars;
+    // the aggregation memos recompute from rawCandles so every timeframe view
+    // extends backward together.
+    if (startDate) {
+      if (rawCandles.length === 0 || rawCandles.length >= MAX_HISTORY_CANDLES) return;
+      const oldest = rawCandles[0].timestamp;
+      setIsLoadingMoreHistory(true);
+      try {
+        const table = formatPairForTable(pair);
+        const older = await fetchWindowedCandles(table, {
+          lte: oldest,
+          limit: 5001,
+          order: 'asc'
+        });
+        // The inclusive lte bound re-returns the oldest bar we already hold.
+        const fresh = older.filter(c => c.timestamp < oldest).map((c: any) => ({
+          timestamp: c.timestamp,
+          open: Number(c.open),
+          high: Number(c.high),
+          low: Number(c.low),
+          close: Number(c.close),
+          volume: c.volume != null ? Number(c.volume) : undefined,
+        }));
+        if (fresh.length === 0) {
+          setHasMoreHistory(false);
+        } else {
+          // ProChart's prependShift is measured in candles of the RENDERED array,
+          // which is the tf-aggregated series, not raw bars. Counting raw bars here
+          // overshifted the viewport by the aggregation ratio (5000 raw 1m bars are
+          // only ~83 rendered 1H candles) and snapped the view outside the loaded
+          // range. Count the distinct display buckets the fresh bars add, using the
+          // same bucket keying as aggregateCandles (local midnight for >= 1D, epoch
+          // floor otherwise), minus the seam bucket when it merges into the candle
+          // we already render.
+          const tfMin = timeframeToMinutes(shiftTimeframeRef.current);
+          let shift = fresh.length;
+          if (tfMin > 0) {
+            const bucketKey = (iso: string) => {
+              const d = new Date(iso);
+              return tfMin >= 1440
+                ? new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+                : Math.floor(d.getTime() / (tfMin * 60_000)) * (tfMin * 60_000);
+            };
+            const added = new Set<number>();
+            for (const c of fresh) added.add(bucketKey(c.timestamp));
+            if (added.has(bucketKey(oldest))) added.delete(bucketKey(oldest));
+            shift = added.size;
+          }
+          setHistoryPrependShift(prev => prev + shift);
+          setRawCandles(prev => [...fresh, ...prev]);
+        }
+      } catch (err) {
+        console.error('[Backtest] Error loading older history:', err);
+      } finally {
+        setIsLoadingMoreHistory(false);
+      }
+      return;
+    }
+
     if (!loadMoreInfoRef.current || loadMoreInfoRef.current.type === 'none') return;
     if (candles.length >= MAX_HISTORY_CANDLES) {
       setHasMoreHistory(false);
@@ -481,7 +577,7 @@ const ProCandlestickChart = ({
     } finally {
       setIsLoadingMoreHistory(false);
     }
-  }, [candles, isLoadingMoreHistory, hasMoreHistory, startDate, isBackgroundLoading]);
+  }, [candles, rawCandles, pair, formatPairForTable, isLoadingMoreHistory, hasMoreHistory, startDate, isBackgroundLoading, timeframe]);
 
   const fetchCandleData = async (useProgressiveLoad = false) => {
     // Capture this fetch's generation. Phase-2 background loads use this to self-cancel
@@ -630,12 +726,16 @@ const ProCandlestickChart = ({
       if (startDate) {
         const startDateObj = new Date(`${startDate}T${startTime}:00Z`);
 
-        // Load 1-minute data for backtest mode - enables partial candle display when switching TFs
-        const historicalMs = 25000 * 60 * 1000; // 25,000 minutes of history
-        const historicalStartDate = new Date(startDateObj.getTime() - historicalMs);
-        console.log('[Backtest] Fetching 1m history:', fullTableName, historicalStartDate.toISOString());
+        // ANCHORED AT THE REPLAY START, by BAR COUNT, not by minutes. The old
+        // window was `start - 25000 minutes`, which assumed every dataset is
+        // 1-minute data; on the hourly/daily sample parquets that window holds a
+        // few hundred bars pinned at its left edge and the chart rendered a
+        // squashed sliver. Walking backward from the start date returns the same
+        // depth of context on any dataset interval, and guarantees the window
+        // CONTAINS the replay point, so scrollback has real history behind it.
+        console.log('[Backtest] Fetching', MAX_RAW_CANDLES, 'bars ending', startDateObj.toISOString(), 'from', fullTableName);
         const data = await fetchWindowedCandles(fullTableName, {
-          gte: historicalStartDate.toISOString(),
+          lte: startDateObj.toISOString(),
           limit: MAX_RAW_CANDLES,
           order: 'asc'
         });

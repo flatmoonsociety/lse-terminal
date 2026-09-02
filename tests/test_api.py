@@ -91,6 +91,22 @@ def test_rejected_key_is_not_saved(client, tmp_path, monkeypatch):
     assert provs["lse"]["configured"] is False
 
 
+def test_directory_env_is_prefix_guarded():
+    """A directory row's fixed demo settings reach the adapter env only under
+    the broker's own prefix; anything else in extra.env is dropped."""
+    from lse_terminal.engine.broker_hub import directory_env
+    extra = {"env": {"NORTHGATE_SENDER_COMP_ID": "NGATE-DEMO-001",
+                     "NORTHGATE_USERNAME": "demo001",
+                     "PATH": "/evil", "PYTHONPATH": "/evil",
+                     "QUANTEX_TOKEN": "other-broker", "northgate_lower": "x",
+                     "NORTHGATE_NUM": 5, "NORTHGATE_LONG": "x" * 300}}
+    assert directory_env("northgate", extra) == {
+        "NORTHGATE_SENDER_COMP_ID": "NGATE-DEMO-001", "NORTHGATE_USERNAME": "demo001"}
+    assert directory_env("northgate", {}) == {}
+    assert directory_env("northgate", {"env": "junk"}) == {}
+    assert directory_env("lse-sim", {"env": {"LSE_SIM_X": "1", "LSE-SIM_Y": "2"}}) == {"LSE_SIM_X": "1"}
+
+
 def test_offline_does_not_block_saving(client, tmp_path, monkeypatch):
     """No network is 'we could not ask', not 'the key is bad'."""
     import lse_terminal.providers.lse as lse_mod
@@ -332,3 +348,67 @@ def test_assistant_stamp_denied_hosted(tmp_path, monkeypatch):
     hosted = TestClient(create_app(), base_url="http://127.0.0.1")
     assert hosted.post("/api/assistant/stamp",
                        json={"script": "x"}).status_code == 403
+
+
+def test_lse_candles_page_past_the_gate_cap(monkeypatch):
+    """A hosted backtest asks for up to 50k bars; the gate hands out 5000 per
+    call. The provider must page (backward for newest-N, forward from a
+    start), honour the gate's inclusive-start / exclusive-end bounds, never
+    duplicate a bar, and keep a chart's 5000-bar ask at exactly one call."""
+    from datetime import datetime, timezone
+    from lse_terminal.providers.lse import LseProvider
+
+    total, step = 12_000, 3600
+    t0 = 1_700_000_000
+    all_ts = [t0 + i * step for i in range(total)]
+
+    def iso(t):
+        return datetime.fromtimestamp(t, timezone.utc).isoformat()
+
+    calls = []
+
+    class Stub:
+        def candles(self, symbol, timeframe, start=None, end=None, limit=5000,
+                    order="asc", dataset=None):
+            calls.append((start, end, limit, order))
+            assert limit <= 5000
+            # Gate rules: only naive `YYYY-MM-DDTHH:MM:SS` bounds, never +00:00.
+            for b in (start, end):
+                assert b is None or ("+" not in b and len(b) == 19)
+            lo = int(datetime.fromisoformat(start).replace(tzinfo=timezone.utc).timestamp()) if start else None
+            hi = int(datetime.fromisoformat(end).replace(tzinfo=timezone.utc).timestamp()) if end else None
+            sel = [t for t in all_ts if (lo is None or t >= lo) and (hi is None or t < hi)]
+            if order == "desc":
+                sel = sel[::-1]
+            return [{"timestamp": iso(t), "open": 1, "high": 2, "low": 0.5,
+                     "close": 1.5, "volume": 3} for t in sel[:limit]]
+
+    p = LseProvider(api_key="test")
+    monkeypatch.setattr(p, "_lse", lambda: Stub())
+
+    # Newest 11,000 of 12,000: three pages (5000, 5000, 1000), no dupes,
+    # ascending, oldest bar is index 1000.
+    df = p.candles("EUR/USD", "1h", limit=11_000)
+    assert len(df) == 11_000 and df["ts"].is_unique
+    assert list(df["ts"]) == all_ts[1000:]
+    assert [c[2] for c in calls] == [5000, 5000, 1000]
+    assert all(c[3] == "desc" for c in calls)
+
+    # A start bound pages forward; a tz-aware ISO start (what the engine's
+    # windowed backtest sends) is normalised, and the end stays exclusive.
+    calls.clear()
+    start = iso(all_ts[100])
+    end = iso(all_ts[7100])
+    df = p.candles("EUR/USD", "1h", limit=50_000, start=start, end=end)
+    assert list(df["ts"]) == all_ts[100:7100]
+    assert all(c[3] == "asc" for c in calls) and len(calls) == 2
+
+    # More than the vault holds: stop when a page under-fills.
+    calls.clear()
+    df = p.candles("EUR/USD", "1h", limit=50_000)
+    assert len(df) == total and len(calls) == 3
+
+    # A chart's page is still one call.
+    calls.clear()
+    df = p.candles("EUR/USD", "1h", limit=5000)
+    assert len(df) == 5000 and len(calls) == 1 and list(df["ts"]) == all_ts[-5000:]

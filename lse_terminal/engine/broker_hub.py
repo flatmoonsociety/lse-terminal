@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -36,6 +37,12 @@ from lse_terminal.contracts import (CANDLE_COLUMNS, Instrument, NotSupported,
 # sources (custom API keys, userdata) are never gated by this.
 DIRECTORY_URL = os.environ.get(
     "LSE_DIRECTORY_URL", "https://api.londonstrategicedge.com/sim/directory")
+# The demo channel is the staging app: it sees brokers still marked dev in
+# the directory (include_dev=1), so a partner can be checked there before its
+# row reaches every public terminal. The shell says which channel this is.
+if (os.environ.get("LSE_TERMINAL_CHANNEL") == "demo"
+        and "LSE_DIRECTORY_URL" not in os.environ):
+    DIRECTORY_URL += "?include_dev=1"
 DIRECTORY_REFRESH_S = 6 * 3600
 
 
@@ -269,6 +276,30 @@ SIM_ADAPTERS = {
 }
 
 
+def directory_env(key: str, extra: dict) -> dict:
+    """Fixed, documented demo settings a directory row hands its adapter.
+
+    Some staged venues issue one fixed demo login in their documentation
+    (a FIX CompID and user, a demo token) and ask nothing of the user. Those
+    ride the row's `extra.env`, so the terminal carries no per-broker
+    credential code and a row that says "no key entry required" is true.
+    Guarded: only this broker's own names (NORTHGATE_* for northgate),
+    string values, capped, so a row can never reach PATH, PYTHONPATH or
+    another broker's process. The user's own typed BRUE_CRED_* still win
+    inside adapters that read both.
+    """
+    env = extra.get("env") if isinstance(extra, dict) else None
+    if not isinstance(env, dict):
+        return {}
+    prefix = re.sub(r"[^A-Z0-9]", "_", str(key).upper()) + "_"
+    out = {}
+    for k, v in env.items():
+        if (isinstance(k, str) and isinstance(v, str) and k.startswith(prefix)
+                and re.fullmatch(r"[A-Z0-9_]{1,64}", k) and len(v) <= 256):
+            out[k] = v
+    return out
+
+
 def directory_brokers(base: Path, directory: dict | None, skip=()) -> dict:
     """Spawnable entries for directory-listed brokers whose adapter is bundled.
 
@@ -294,7 +325,8 @@ def directory_brokers(base: Path, directory: dict | None, skip=()) -> dict:
             # The endpoint is public config, not a secret, so it rides env like
             # any other adapter knob; the broker's own credentials (if its
             # credential_form asks for any) still land only in its 700 state dir.
-            "endpoint_env": spec["env"](ep, b.get("extra") or {}),
+            "endpoint_env": {**spec["env"](ep, b.get("extra") or {}),
+                             **directory_env(key, b.get("extra") or {})},
         }
     return out
 

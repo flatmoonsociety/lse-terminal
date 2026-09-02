@@ -22,6 +22,19 @@ const http = require("http");
 const net = require("net");
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
+
+// Release channel, stamped into package.json at build time (extraMetadata
+// in build-win.ps1 / build-mac.sh). The demo channel is LSE DEMO TERMINAL:
+// the same code as a separate app that lives next to the public install,
+// so it gets its own window title and its own engine config folder (key,
+// workspace, imports, chats), never the public app's.
+const CHANNEL = (() => { try { return require("./package.json").lseChannel || "public"; } catch { return "public"; } })();
+const IS_DEMO = CHANNEL === "demo";
+const APP_TITLE = IS_DEMO ? "LSE Demo Terminal" : "LSE Terminal";
+// Same path the engine's config_dir() resolves on every OS; the demo app
+// hands its own folder to the engine through LSE_TERMINAL_CONFIG_DIR.
+const CONFIG_DIR = path.join(os.homedir(), ".config", IS_DEMO ? "lse-terminal-demo" : "lse-terminal");
 
 let sidecar = null;
 let win = null;
@@ -201,6 +214,28 @@ function setupAutoUpdate() {
   // 'error' handler below keeps a missing feed or an offline check harmless.
   try { ({ autoUpdater } = require("electron-updater")); }
   catch (e) { autoUpdater = null; return; } // build without the dep: plain app
+  // Private-shelf builds bake a requestHeaders block into app-update.yml
+  // (the X-LSE-Feed token nginx maps to auth off). electron-updater only
+  // adopts requestHeaders when setFeedURL() is called with an options
+  // object; the block in the on-disk yml is never read, so every check
+  // went out bare and the shelf answered 401 (seen in the origin log for
+  // every launch). Lift the block onto the updater ourselves. The yml is
+  // two-level and written by electron-builder, so a line parser is enough;
+  // any failure here leaves the headers unset, which is the public-feed case.
+  try {
+    const yml = fs.readFileSync(path.join(process.resourcesPath, "app-update.yml"), "utf8");
+    const headers = {};
+    let inBlock = false;
+    for (const line of yml.split(/\r?\n/)) {
+      if (/^requestHeaders:\s*$/.test(line)) { inBlock = true; continue; }
+      if (inBlock) {
+        const m = /^\s+([^:\s][^:]*):\s*(.+?)\s*$/.exec(line);
+        if (m) { headers[m[1]] = m[2].replace(/^["']|["']$/g, ""); continue; }
+        inBlock = false;
+      }
+    }
+    if (Object.keys(headers).length) autoUpdater.requestHeaders = headers;
+  } catch (e) { /* no yml or unreadable: public feed needs no headers */ }
   // A failed check must never take the app down; offline is normal. The
   // button just stays on whatever it last knew.
   autoUpdater.on("error", () => {
@@ -286,7 +321,11 @@ function spawnSidecar() {
   sidecar = spawn(cmd, [...args, "--no-browser", "--port", String(currentPort)], {
     stdio: ["ignore", "pipe", "pipe"],
     cwd: cwd || undefined,
-    env: { ...process.env, ...(dev ? { LSE_TERMINAL_DEV: "1" } : {}) },
+    env: { ...process.env, ...(dev ? { LSE_TERMINAL_DEV: "1" } : {}),
+           // The engine reads the channel too (the demo app fetches the
+           // staging directory, see broker_hub.DIRECTORY_URL).
+           LSE_TERMINAL_CHANNEL: CHANNEL,
+           ...(IS_DEMO ? { LSE_TERMINAL_CONFIG_DIR: CONFIG_DIR } : {}) },
   });
   sidecar.on("error", (e) => recordEngineOutput(`[shell] spawn error: ${e}\n`));
   // Drain the pipes: an unread pipe can fill and stall the engine, and the
@@ -311,7 +350,7 @@ function spawnSidecar() {
         .then(() => win && win.loadURL(`http://127.0.0.1:${currentPort}/`))
         .catch(() => {});
     } else {
-      dialog.showErrorBox("LSE Terminal",
+      dialog.showErrorBox(APP_TITLE,
         `The terminal engine stopped repeatedly (code ${code}). ` +
         `Please reopen the app.${engineOutTail()}`);
       app.quit();
@@ -323,9 +362,7 @@ function spawnSidecar() {
 // AI panel's agents can literally see the chart the user sees. The UI asks
 // for a fresh capture right before each agent turn (preload.js bridge);
 // one is also taken shortly after boot so a first turn never finds nothing.
-// Same path the engine's config_dir() resolves on every OS.
-const os = require("os");
-const AI_WS = path.join(os.homedir(), ".config", "lse-terminal", "ai-workspace");
+const AI_WS = path.join(CONFIG_DIR, "ai-workspace");
 
 async function captureToWorkspace() {
   if (!win) return { ok: false };
@@ -359,7 +396,7 @@ async function start() {
     ...bounds,
     minWidth: 980,
     minHeight: 600,
-    title: "LSE Terminal",
+    title: APP_TITLE,
     // Window/taskbar icon for unpackaged (dev) runs and Linux; packaged
     // Windows builds take the icon from the exe (electron-builder build/
     // resources), where this option is redundant but harmless.
@@ -369,6 +406,13 @@ async function start() {
     show: false,
     webPreferences: { contextIsolation: true, nodeIntegration: false,
                       preload: path.join(__dirname, "preload.js") },
+  });
+  // The page names itself "... · LSE Terminal" in document.title; the demo
+  // app rewrites that so the title bar and taskbar say which app this is.
+  win.on("page-title-updated", (e, title) => {
+    if (!IS_DEMO) return;
+    e.preventDefault();
+    win.setTitle(title.replace(/LSE Terminal/g, APP_TITLE));
   });
   win.on("close", saveWindowState);
   win.on("closed", () => { win = null; });
@@ -383,7 +427,7 @@ async function start() {
     // can take a while on a slow disk; do not give up early and quit.
     await waitForHealth(port, 90000);
   } catch (e) {
-    dialog.showErrorBox("LSE Terminal",
+    dialog.showErrorBox(APP_TITLE,
       `The terminal engine failed to start: ${e.message}${engineOutTail()}`);
     app.quit();
     return;

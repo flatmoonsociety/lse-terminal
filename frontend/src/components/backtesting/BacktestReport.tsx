@@ -371,7 +371,10 @@ Grade: ${grade.grade} (${grade.label})`;
 
       await api.upsertBacktestSession(sessionData);
 
-      toast.success('Backtest results saved to My Backtests!');
+      // The terminal has no "My Backtests" page (that is the live site's
+      // dashboard); the row lands in the local workspace store. Name what
+      // actually happened rather than a surface that does not exist here.
+      toast.success('Backtest report saved');
       if (onEndComplete) {
         onEndComplete();
       } else {
