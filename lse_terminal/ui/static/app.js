@@ -13871,6 +13871,23 @@ function renderPlotPanes(hostId, plots) {
   const names = Object.keys(plots || {}).filter((k) => (plots[k] || []).length);
   host.classList.toggle("hidden", !names.length);
   if (!names.length) return;
+  // Keep the user's collapsed/expanded choice while a new run replaces the
+  // pane data. The control lives in the strip so it is available in both the
+  // BACKTEST IDE and WORKSPACE editor without adding another toolbar row.
+  host._plotCollapsed = Boolean(host._plotCollapsed);
+  const toggle = document.createElement("button");
+  toggle.className = "plot-toggle";
+  toggle.type = "button";
+  toggle.setAttribute("aria-expanded", String(!host._plotCollapsed));
+  const updateToggle = () => {
+    host.classList.toggle("collapsed", host._plotCollapsed);
+    toggle.textContent = host._plotCollapsed ? "Expand plots" : "Collapse plots";
+    toggle.setAttribute("aria-expanded", String(!host._plotCollapsed));
+    toggle.title = host._plotCollapsed ? "Show strategy plots" : "Hide strategy plots";
+  };
+  toggle.onclick = () => { host._plotCollapsed = !host._plotCollapsed; updateToggle(); };
+  host.appendChild(toggle);
+  updateToggle();
   let ci = 0;
   for (const name of names) {
     const pane = document.createElement("div");
