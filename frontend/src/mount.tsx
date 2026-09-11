@@ -1361,15 +1361,24 @@ const LSENotebooks = {
 // The shell owns the dialog and its focus lifecycle; this island owns the report.
 import StrategyBacktestResults, { type StrategyBacktestResultsProps } from '@/components/backtesting/StrategyBacktestResults';
 
-let strategyResultsRoot: Root | null = null;
+const strategyResultsRoots = new Map<HTMLElement, Root>();
 const LSEBacktestResults = {
   mount(el: HTMLElement, props: StrategyBacktestResultsProps) {
-    if (!strategyResultsRoot) strategyResultsRoot = createRoot(el);
-    strategyResultsRoot.render(<StrategyBacktestResults {...props} />);
+    let root = strategyResultsRoots.get(el);
+    if (!root) {
+      root = createRoot(el);
+      strategyResultsRoots.set(el, root);
+    }
+    root.render(<StrategyBacktestResults {...props} />);
   },
-  unmount() {
-    strategyResultsRoot?.unmount();
-    strategyResultsRoot = null;
+  unmount(el?: HTMLElement) {
+    if (el) {
+      strategyResultsRoots.get(el)?.unmount();
+      strategyResultsRoots.delete(el);
+      return;
+    }
+    for (const root of strategyResultsRoots.values()) root.unmount();
+    strategyResultsRoots.clear();
   },
 };
 

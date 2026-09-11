@@ -1,6 +1,7 @@
 // Strategy-run results are a shell-mounted island, like DataViz and QuantModels.
 // This deliberately leaves the manual replay report and live chart untouched.
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { createRoot } from 'react-dom/client';
 import * as echarts from 'echarts';
 import { finite, resultNumber as number, utcTime, tradeCsv, strategyAnalytics, type StrategyResult, type StrategyTrade } from './strategyResults';
 
@@ -63,6 +64,25 @@ const CSS = `
 @media(max-width:1100px) { .sbr-kpis { grid-template-columns:repeat(3,minmax(0,1fr)); } }
 @media(max-width:760px) { .sbr-grid { grid-template-columns:minmax(0,1fr); } .sbr-kpis { grid-template-columns:repeat(2,minmax(0,1fr)); }
   .sbr-header { padding:12px; } .sbr-body { padding:12px; } .sbr-value { font-size:19px; } }
+.sbr-print { --text:#182433; --dim:#526173; --edge:#d2d9e1; --bg:#fff; --bg2:#f4f6f8; --panel:#fff; --up:#087f70; --down:#c42948;
+  height:auto; width:277mm; margin:0 auto; background:#fff; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+.sbr-print .sbr-header { padding:0 0 14px; }
+.sbr-print .sbr-body { overflow:visible; flex:none; padding:14px 0 0; }
+.sbr-print .sbr-grid { display:block; }
+.sbr-print .sbr-card { margin-bottom:14px; break-inside:avoid; }
+.sbr-print .sbr-kpis { grid-template-columns:repeat(6,minmax(0,1fr)); break-inside:avoid; }
+.sbr-print .sbr-chart { height:265px; }
+.sbr-print .sbr-chart-large { height:300px; }
+.sbr-print .sbr-table-wrap { overflow:visible; }
+.sbr-print .sbr-table-wrap:has(table tbody tr:nth-child(12)) { break-inside:auto; }
+.sbr-print .sbr-card:has(table tbody tr:nth-child(12)) { break-inside:auto; }
+.sbr-print table { white-space:normal; table-layout:fixed; }
+.sbr-print th,.sbr-print td { padding:6px 4px; font-size:10px; overflow-wrap:anywhere; }
+.sbr-print thead { display:table-header-group; }
+.sbr-print tr { break-inside:avoid; }
+.sbr-print .sbr-section-title { margin:0 0 14px; padding-top:8px; break-after:avoid; }
+.sbr-print .sbr-page-break { break-before:page; }
+@media print { .sbr-print { width:100%; } }
 `;
 
 const tone = (value: unknown) => !finite(value) || value === 0 ? '' : value > 0 ? 'sbr-up' : 'sbr-down';
@@ -76,9 +96,11 @@ function Chart({ title, option, large = false }: { title: string; option: echart
     if (!host.current) return;
     // Direct ECharts is the established island pattern; its React wrapper
     // does not render reliably in this repository's IIFE build.
-    const chart = echarts.init(host.current);
+    const printable = !!host.current.closest('.sbr-print');
+    const chart = echarts.init(host.current, undefined, { renderer: printable ? 'svg' : 'canvas' });
+    const chartDocument = host.current.ownerDocument;
     const render = () => {
-      const styles = getComputedStyle(document.documentElement);
+      const styles = getComputedStyle(host.current!);
       const css = (name: string, fallback: string) => styles.getPropertyValue(name).trim() || fallback;
       const ink = css('--text', '#e8e8e8');
       const dim = css('--dim', '#b0b0b0');
@@ -96,13 +118,14 @@ function Chart({ title, option, large = false }: { title: string; option: echart
         yAxis: { type: 'value', scale: true, axisLabel: { color: dim, fontSize: 10, formatter: compact },
           splitLine: { lineStyle: { color: edge } } },
         ...option,
+        ...(printable ? { dataZoom: [], tooltip: { show: false } } : {}),
       }, true);
     };
     render();
     const resize = new ResizeObserver(() => chart.resize());
     resize.observe(host.current);
     const theme = new MutationObserver(render);
-    theme.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style'] });
+    theme.observe(chartDocument.documentElement, { attributes: true, attributeFilter: ['class', 'style'] });
     return () => { resize.disconnect(); theme.disconnect(); chart.dispose(); };
   }, [option, title]);
   return <div role="img" aria-label={title} className={`sbr-chart${large ? ' sbr-chart-large' : ''}`} ref={host} />;
@@ -129,7 +152,7 @@ function download(text: string, name: string, type: string) {
 
 const PAGE_SIZE = 50;
 type SortKey = 'id' | 'entry_ts' | 'exit_ts' | 'pnl' | 'pnl_pct' | 'bars_held';
-function TradeLedger({ trades, filename }: { trades: StrategyTrade[]; filename: string }) {
+function TradeLedger({ trades, filename, printable = false }: { trades: StrategyTrade[]; filename: string; printable?: boolean }) {
   const [side, setSide] = useState('all');
   const [outcome, setOutcome] = useState('all');
   const [sort, setSort] = useState<SortKey>('id');
@@ -144,10 +167,10 @@ function TradeLedger({ trades, filename }: { trades: StrategyTrade[]; filename: 
   const currentPage = Math.min(page, pageCount - 1);
   const orderBy = (key: SortKey) => { setSort(key); setDescending(sort === key ? !descending : false); setPage(0); };
   const heading = (key: SortKey, label: string) => <th aria-sort={sort === key ? descending ? 'descending' : 'ascending' : 'none'}>
-    <button onClick={() => orderBy(key)}>{label}{sort === key ? descending ? ' ↓' : ' ↑' : ''}</button>
+    {printable ? label : <button onClick={() => orderBy(key)}>{label}{sort === key ? descending ? ' ↓' : ' ↑' : ''}</button>}
   </th>;
   return <Card title="Trade ledger" subtitle="All timestamps in UTC" full>
-    <div className="sbr-toolbar">
+    {!printable && <div className="sbr-toolbar">
       <label>Direction<select value={side} onChange={e => { setSide(e.target.value); setPage(0); }}>
         <option value="all">All directions</option><option value="long">Long</option><option value="short">Short</option>
       </select></label>
@@ -156,21 +179,21 @@ function TradeLedger({ trades, filename }: { trades: StrategyTrade[]; filename: 
       </select></label>
       <button disabled={!filtered.length} onClick={() => download(tradeCsv(filtered), `${filename}-trades.csv`, 'text/csv;charset=utf-8')}>Export filtered CSV</button>
       <span className="sbr-sub">{number(filtered.length, 0)} of {number(trades.length, 0)} trades</span>
-    </div>
+    </div>}
     <div className="sbr-table-wrap" tabIndex={0} aria-label="Trade ledger, scroll horizontally for all columns">
       <table><thead><tr>{heading('id', '#')}<th>Direction</th>{heading('entry_ts', 'Entry UTC')}{heading('exit_ts', 'Exit UTC')}
         <th>Entry price</th><th>Exit price</th><th>Quantity</th>{heading('pnl', 'P&L')}{heading('pnl_pct', 'P&L %')}{heading('bars_held', 'Bars held')}
-      </tr></thead><tbody>{filtered.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE).map(t => <tr key={t.id}>
+      </tr></thead><tbody>{(printable ? filtered : filtered.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE)).map(t => <tr key={t.id}>
         <td>{t.id}</td><td>{t.direction}</td><td>{utcTime(t.entry_ts)}</td><td>{t.exit_ts == null ? 'Open' : utcTime(t.exit_ts)}</td>
         <td>{precise(t.entry_price)}</td><td>{precise(t.exit_price)}</td><td>{precise(t.qty)}</td>
         <td className={tone(t.pnl)}>{number(t.pnl)}</td><td className={tone(t.pnl_pct)}>{pct(t.pnl_pct)}</td><td>{number(t.bars_held, 0)}</td>
       </tr>)}</tbody></table>
       {!filtered.length && <p className="sbr-empty">{trades.length ? 'No trades match these filters.' : 'The strategy completed without any trades.'}</p>}
     </div>
-    <div className="sbr-pager"><span className="sbr-sub">Page {currentPage + 1} of {pageCount} · {PAGE_SIZE} rows per page</span>
+    {!printable && <div className="sbr-pager"><span className="sbr-sub">Page {currentPage + 1} of {pageCount} · {PAGE_SIZE} rows per page</span>
       <div className="sbr-actions"><button disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>Previous</button>
         <button disabled={currentPage + 1 >= pageCount} onClick={() => setPage(currentPage + 1)}>Next</button></div>
-    </div>
+    </div>}
   </Card>;
 }
 
@@ -183,9 +206,24 @@ const line = (name: string, data: [number, number | null][], extra = {}): echart
   sampling: 'lttb', lineStyle: { width: 1.7 }, ...extra,
 });
 
-export default function StrategyBacktestResults({ result, strategy, elapsedMs, onClose }: StrategyBacktestResultsProps) {
+export default function StrategyBacktestResults({ result, strategy, elapsedMs, onClose, printable = false, onPrintReady }:
+  StrategyBacktestResultsProps & { printable?: boolean; onPrintReady?: () => void }) {
   const [tab, setTab] = useState('overview');
+  const [printing, setPrinting] = useState(false);
+  const [printError, setPrintError] = useState('');
+  const printCleanup = useRef<(() => void) | null>(null);
   const body = useRef<HTMLDivElement>(null);
+  useEffect(() => () => printCleanup.current?.(), []);
+  useEffect(() => {
+    if (!printable || !onPrintReady) return;
+    const frame = body.current!.ownerDocument.defaultView!;
+    // Child chart effects finish first; wait for font/layout before opening print.
+    let cancelled = false;
+    frame.document.fonts.ready.then(() => frame.requestAnimationFrame(() => frame.requestAnimationFrame(() => {
+      if (!cancelled) onPrintReady();
+    })));
+    return () => { cancelled = true; };
+  }, [printable, onPrintReady]);
   const a = useMemo(() => strategyAnalytics(result), [result]);
   const s = result.stats || {};
   const x = s.extended || {};
@@ -193,6 +231,32 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
   const benchmark = (result.benchmark_curve || []).filter(([ts, value]) => finite(ts) && finite(value));
   const plots = Object.entries(result.plots || {}).filter(([, values]) => values.length);
   const filename = `backtest-${result.symbol || 'strategy'}-${utcTime(a.equity[a.equity.length - 1]?.[0]).slice(0, 10)}`.replace(/[^a-zA-Z0-9_.-]/g, '_');
+  const exportPdf = () => {
+    printCleanup.current?.();
+    setPrinting(true); setPrintError('');
+    // Native Chromium printing keeps text selectable and charts as vectors.
+    // A separate render includes every section/trade, independent of UI filters.
+    const iframe = document.createElement('iframe');
+    iframe.title = 'Printable complete backtest report';
+    iframe.setAttribute('aria-hidden', 'true');
+    iframe.style.cssText = 'position:fixed;left:-12000px;top:0;width:1120px;height:900px;border:0;pointer-events:none';
+    document.body.appendChild(iframe);
+    const frame = iframe.contentWindow!;
+    const doc = frame.document;
+    doc.open(); doc.write('<!doctype html><html><head></head><body style="margin:0"></body></html>'); doc.close();
+    doc.title = filename;
+    const host = doc.createElement('div');
+    doc.body.appendChild(host);
+    const root = createRoot(host);
+    const cleanup = () => { root.unmount(); iframe.remove(); printCleanup.current = null; };
+    printCleanup.current = cleanup;
+    frame.addEventListener('afterprint', () => { setPrinting(false); cleanup(); }, { once: true });
+    root.render(<StrategyBacktestResults result={result} strategy={strategy} elapsedMs={elapsedMs} printable onPrintReady={() => {
+      try { frame.focus(); frame.print(); }
+      catch (error) { setPrintError(`Could not open PDF export: ${String(error)}`); cleanup(); }
+      finally { setPrinting(false); }
+    }} />);
+  };
   const tabs = [['overview', 'Overview'], ['analysis', 'Trade analysis'], ['trades', 'Trade ledger'], ['statistics', 'Statistics'],
     ...(plots.length ? [['plots', `Strategy plots (${plots.length})`]] : [])];
   const charts = useMemo(() => {
@@ -223,23 +287,26 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
   const annualNote = 'Engine ratios annualize per-bar returns using median bar spacing and a 365.25-day year. Short samples can produce extreme annualized values.';
   const monthsByYear = Array.from(new Set(a.months.map(m => m.period.slice(0, 4))));
   const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  return <div className="sbr">
-    <style>{CSS}</style>
+  return <div className={`sbr${printable ? ' sbr-print' : ''}`}>
+    <style>{CSS}{printable && '@page { size:A4 landscape; margin:10mm; }'}</style>
     <header className="sbr-header">
       <div><div className="sbr-label">Strategy research · completed run</div><h2 id="strategy-results-title">Backtest results</h2>
         <div className="sbr-sub">{strategy || result.engine} · {result.symbol} · {result.timeframe}
           {finite(elapsedMs) && ` · ${(elapsedMs / 1000).toFixed(2)}s`}</div>
       </div>
-      <div className="sbr-actions">
+      {!printable && <div className="sbr-actions">
+        <button disabled={printing} onClick={exportPdf} title="Print the complete report; choose Save as PDF in the print dialog">{printing ? 'Preparing PDF…' : 'Export PDF'}</button>
         <button onClick={() => download(JSON.stringify({ ...result, report_context: { strategy, elapsed_ms: elapsedMs } }, null, 2), `${filename}.json`, 'application/json')}>Export report JSON</button>
         <button onClick={() => download(tradeCsv(result.trades || []), `${filename}-trades.csv`, 'text/csv;charset=utf-8')}>Export trades CSV</button>
         {onClose && <button onClick={onClose} aria-label="Close backtest results">Close</button>}
-      </div>
+      </div>}
     </header>
-    <nav className="sbr-tabs" aria-label="Backtest report sections">{tabs.map(([id, label]) => <button key={id}
-      aria-current={tab === id ? 'page' : undefined} onClick={() => { setTab(id); body.current?.scrollTo(0, 0); }}>{label}</button>)}</nav>
+    {printError && <p className="sbr-note" role="alert">{printError}</p>}
+    {!printable && <nav className="sbr-tabs" aria-label="Backtest report sections">{tabs.map(([id, label]) => <button key={id}
+      aria-current={tab === id ? 'page' : undefined} onClick={() => { setTab(id); body.current?.scrollTo(0, 0); }}>{label}</button>)}</nav>}
     <div className="sbr-body" ref={body}>
-      {tab === 'overview' && <>
+      {(printable || tab === 'overview') && <>
+        {printable && <h2 className="sbr-section-title">Overview</h2>}
         <div className="sbr-kpis">{[
           ['Net profit', number(result.net_profit), tone(result.net_profit)], ['Total return', pct(totalReturn), tone(totalReturn)],
           ['Maximum drawdown', pct(a.maxDrawdownPct), a.maxDrawdownPct > 0 ? 'sbr-down' : ''],
@@ -251,7 +318,7 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
             <p className="sbr-note">{utcTime(a.equity[0]?.[0])} — {utcTime(a.equity[a.equity.length - 1]?.[0])} UTC.
               {' '}Initial capital {number(result.initial_capital)} · final equity {number(result.final_equity)}.
               {benchmark.length > 0 && ' Buy & hold invests the initial capital at the first close, without transaction costs.'}
-              {' '}Scroll to zoom; drag the range below each time chart. Monetary values use the strategy account units.</p>
+              {!printable && ' Scroll to zoom; drag the range below each time chart.'} Monetary values use the strategy account units.</p>
           </Card>
           <Card title="Drawdown" subtitle="Decline from running equity peak">
             <Chart title="Percentage drawdown from running equity peak, including initial capital" option={charts.drawdown} />
@@ -272,7 +339,8 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
           </Card>
         </div>
       </>}
-      {tab === 'analysis' && <div className="sbr-grid">
+      {printable && <h2 className="sbr-section-title sbr-page-break">Trade analysis</h2>}
+      {(printable || tab === 'analysis') && <div className="sbr-grid">
         <Card title="Trade outcomes" subtitle={`${number(a.trades.length, 0)} total trades`} full>
           <div className="sbr-kpis" style={{ marginBottom: 0 }}>{[
             ['Winners', number(a.wins, 0), 'sbr-up'], ['Losers', number(a.losses, 0), 'sbr-down'], ['Breakeven', number(a.breakeven, 0), ''],
@@ -286,8 +354,9 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
         <Card title="Long / short performance" full><div className="sbr-table-wrap"><table><thead><tr><th>Direction</th><th>Trades</th><th>Net P&L</th><th>Win rate</th><th>Average trade</th></tr></thead>
           <tbody>{a.direction.map(d => <tr key={d.side}><td>{d.side}</td><td>{d.count}</td><td className={tone(d.net)}>{number(d.net)}</td><td>{pct(d.winRate)}</td><td className={tone(d.average)}>{number(d.average)}</td></tr>)}</tbody></table></div></Card>
       </div>}
-      {tab === 'trades' && <TradeLedger trades={result.trades || []} filename={filename} />}
-      {tab === 'statistics' && <div className="sbr-grid">
+      {!printable && tab === 'trades' && <TradeLedger trades={result.trades || []} filename={filename} />}
+      {printable && <h2 className="sbr-section-title sbr-page-break">Statistics</h2>}
+      {(printable || tab === 'statistics') && <div className="sbr-grid">
         <Card title="Performance"><Metrics rows={[
           ['Initial capital', number(result.initial_capital)], ['Final equity', number(result.final_equity)], ['Net profit', number(result.net_profit)],
           ['Total return', pct(totalReturn)], ['Gross profit', number(s.grossProfit)], ['Gross loss', number(s.grossLoss)],
@@ -314,7 +383,8 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
           ['Run duration', finite(elapsedMs) ? `${number(elapsedMs / 1000)} seconds` : '—'],
         ]} /><p className="sbr-note">{annualNote}</p><p className="sbr-note">— means unavailable. Export JSON preserves the original engine result and strategy plot data.</p></Card>
       </div>}
-      {tab === 'plots' && <div className="sbr-grid">{plots.map(([name, values]) => <Card key={name} title={name} full>
+      {printable && plots.length > 0 && <h2 className="sbr-section-title sbr-page-break">Strategy plots</h2>}
+      {(printable || tab === 'plots') && <div className="sbr-grid">{plots.map(([name, values]) => <Card key={name} title={name} full>
         <Chart title={`Strategy plot: ${name}`} option={{ dataZoom: zoom, series: [line(name, values)] }} />
       </Card>)}</div>}
     </div>
