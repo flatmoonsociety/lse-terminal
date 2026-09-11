@@ -334,6 +334,7 @@ class PythonRunner(BacktestEngine):
         trades = self._normalize(raw, df)
         equity_curve, final_equity, bars_in_market = self._account(
             trades, df, capital, commission_pct / 100.0)
+        benchmark_curve = self._benchmark_curve(df, capital)
 
         stats = self._stats(trades, equity_curve, capital, final_equity,
                             bars_in_market, bool(options.get("extended_stats")))
@@ -342,8 +343,27 @@ class PythonRunner(BacktestEngine):
             initial_capital=capital, final_equity=final_equity,
             net_profit=final_equity - capital,
             stats=stats, trades=trades, equity_curve=equity_curve,
-            plots=plots,
+            benchmark_curve=benchmark_curve, plots=plots,
         )
+
+    @staticmethod
+    def _benchmark_curve(df: pd.DataFrame, capital: float) -> list[list[float]]:
+        """Normalize a buy-and-hold close series to the starting capital.
+
+        The first close is the baseline and each later point is marked at its
+        close. This is a visual comparison only; it never affects strategy
+        accounting, fees, or the reported final equity.
+        """
+        if df is None or len(df) == 0:
+            return []
+        closes = df["close"].to_numpy(dtype="float64")
+        first = float(closes[0])
+        if not math.isfinite(first) or first == 0.0:
+            return []
+        ts = df["ts"].to_numpy(dtype="int64")
+        return [[int(t), float(capital * (close / first))]
+                for t, close in zip(ts, closes)
+                if math.isfinite(float(close))]
 
     def _execute(self, script: str, df: pd.DataFrame, params: dict,
                  datasets: dict,
