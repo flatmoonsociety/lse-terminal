@@ -87,6 +87,9 @@ class BacktestResult:
     trades: list[Trade] = field(default_factory=list)
     # Equity curve aligned to bars: [[ts, equity], ...].
     equity_curve: list[list[float]] = field(default_factory=list)
+    # Buy-and-hold baseline aligned to the same bars, normalized to the
+    # initial capital using the first/each bar close.
+    benchmark_curve: list[list[float]] = field(default_factory=list)
     # Series the strategy declared via `plots`: {name: [[ts, value], ...]},
     # already validated and chart-ready (runner._collect_plots).
     plots: dict = field(default_factory=dict)
@@ -99,6 +102,7 @@ class BacktestResult:
             "final_equity": self.final_equity, "net_profit": self.net_profit,
             "stats": self.stats,
             "equity_curve": self.equity_curve,
+            "benchmark_curve": self.benchmark_curve,
             "plots": self.plots,
             "trades": [
                 {"entry_ts": t.entry_ts, "exit_ts": t.exit_ts,

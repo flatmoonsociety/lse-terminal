@@ -2623,6 +2623,53 @@ function setupLayouts() {
 /* ---------- backtest ---------- */
 
 const backtest = { engine: "python", equityChart: null, equitySeries: null };
+let backtestReportReturnFocus = null;
+
+/* Detailed strategy report. The shell owns navigation and the modal; the
+   React island owns report rendering and analytics. Keeping this bridge
+   imperative lets every existing run path (BACKTEST, IDE, WORKSPACE, and the
+   assistant) open the same report without moving their engine calls. */
+function closeBacktestReport() {
+  if (window.LSEBacktestResults) window.LSEBacktestResults.unmount();
+  const modal = $("bt-report-modal");
+  modal.classList.add("hidden");
+  if (backtestReportReturnFocus && document.contains(backtestReportReturnFocus)) {
+    backtestReportReturnFocus.focus();
+  }
+  backtestReportReturnFocus = null;
+}
+
+function openBacktestReport(result, context = {}) {
+  if (!result || !window.LSEBacktestResults) return;
+  const modal = $("bt-report-modal");
+  if (modal.classList.contains("hidden")) backtestReportReturnFocus = document.activeElement;
+  modal.classList.remove("hidden");
+  window.LSEBacktestResults.mount($("bt-report-root"), {
+    result,
+    strategy: context.strategy || "",
+    elapsedMs: context.elapsedMs,
+    onClose: closeBacktestReport,
+  });
+  requestAnimationFrame(() => modal.querySelector("button, [href], select, input, [tabindex]:not([tabindex='-1'])")?.focus());
+}
+
+document.addEventListener("keydown", (e) => {
+  const modal = $("bt-report-modal");
+  if (modal.classList.contains("hidden")) return;
+  if (e.key === "Escape") {
+    e.preventDefault();
+    closeBacktestReport();
+    return;
+  }
+  if (e.key === "Tab") {
+    const focusable = [...modal.querySelectorAll("button, [href], select, input, textarea, [tabindex]:not([tabindex='-1'])")]
+      .filter((el) => !el.disabled && el.offsetParent !== null);
+    if (!focusable.length) { e.preventDefault(); modal.focus(); return; }
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+});
 
 function setupBacktest() {
   $("bt-open").onclick = async () => {
@@ -6116,6 +6163,7 @@ function renderBacktest(r) {
   pushToChart();
 
   status(`backtest · ${r.trades.length} trades · net ${fmtMoney(r.net_profit)}`);
+  openBacktestReport(r, { strategy: "BACKTEST editor" });
 }
 
 /* ---------- my data (own CSV imports) ---------- */
@@ -13690,6 +13738,7 @@ async function pyBacktest() {
     const res = await r.json();
     pyTermReport(res, performance.now() - t0);
     renderPlotPanes("py-plots", res.plots);
+    openBacktestReport(res, { strategy: py.open || "strategy.py", elapsedMs: performance.now() - t0 });
     // Remember the run per script so the library's SCRIPTS chips show the
     // last result next to the file name.
     if (typeof res.net_profit === "number") {
@@ -14389,6 +14438,7 @@ async function wsxBacktest() {
     const res = await r.json();
     pyTermReport(res, performance.now() - t0, t);
     renderPlotPanes("wsx-plots", res.plots);
+    openBacktestReport(res, { strategy: wsx.open || "strategy.py", elapsedMs: performance.now() - t0 });
     // Same last-run bookkeeping as the BACKTEST tab; the library chips key
     // on the workspace path, which both editors share.
     if (typeof res.net_profit === "number") {

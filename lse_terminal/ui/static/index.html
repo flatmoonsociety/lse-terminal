@@ -384,6 +384,10 @@ def my_ind(df, length=20):
   </section>
   <!-- Host for the ported manual backtester (mounted on demand). -->
   <section id="manual-backtest" class="hidden"></section>
+  <!-- Detailed report opened after every completed Python backtest. -->
+  <div id="bt-report-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="strategy-results-title" tabindex="-1">
+    <div id="bt-report-root"></div>
+  </div>
   <!-- Connection screen: the full-surface version of the little conn-menu
        dropdown. Opened from #conn-bar. Same information architecture (the LSE
        data connection first, then brokers) with room for logos, taglines and

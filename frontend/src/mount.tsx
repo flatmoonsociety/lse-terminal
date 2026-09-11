@@ -1357,6 +1357,22 @@ const LSENotebooks = {
   },
 };
 
+// Strategy backtests use the same shell/island boundary as the research pages.
+// The shell owns the dialog and its focus lifecycle; this island owns the report.
+import StrategyBacktestResults, { type StrategyBacktestResultsProps } from '@/components/backtesting/StrategyBacktestResults';
+
+let strategyResultsRoot: Root | null = null;
+const LSEBacktestResults = {
+  mount(el: HTMLElement, props: StrategyBacktestResultsProps) {
+    if (!strategyResultsRoot) strategyResultsRoot = createRoot(el);
+    strategyResultsRoot.render(<StrategyBacktestResults {...props} />);
+  },
+  unmount() {
+    strategyResultsRoot?.unmount();
+    strategyResultsRoot = null;
+  },
+};
+
 declare global {
   interface Window {
     LSEChart: typeof LSEChart;
@@ -1366,6 +1382,7 @@ declare global {
     LSEDataViz: typeof LSEDataViz;
     LSEQuantModels: typeof LSEQuantModels;
     LSENotebooks: typeof LSENotebooks;
+    LSEBacktestResults: typeof LSEBacktestResults;
   }
 }
 // Shell entry points for the top-bar Layout button. Attached as PROPERTIES of
@@ -1386,5 +1403,6 @@ window.LSEEconCalendar = LSEEconCalendar;
 window.LSEDataViz = LSEDataViz;
 window.LSEQuantModels = LSEQuantModels;
 window.LSENotebooks = LSENotebooks;
+window.LSEBacktestResults = LSEBacktestResults;
 
 export default LSEChart;

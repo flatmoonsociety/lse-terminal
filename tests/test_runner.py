@@ -187,6 +187,21 @@ def test_equity_curve_marks_open_positions_to_market(runner):
     assert len(set(mid)) > 1, "equity was flat while a position was open"
 
 
+def test_benchmark_curve_is_normalized_buy_and_hold(runner):
+    df = candles(n=4, start=100.0, drift=0.0, seed=2)
+    # Make the close path explicit; the benchmark must use closes rather than
+    # the strategy's fills or the bar opens.
+    df["close"] = [100.0, 110.0, 90.0, 125.0]
+    result = runner.run("trades = []", df, "T", "1d",
+                        options={"capital": 10_000})
+    assert result.benchmark_curve == [
+        [int(df.ts[0]), 10_000.0],
+        [int(df.ts[1]), 11_000.0],
+        [int(df.ts[2]), 9_000.0],
+        [int(df.ts[3]), 12_500.0],
+    ]
+
+
 def test_the_account_cannot_be_spent_twice(runner):
     """Default sizing is the whole account; a second concurrent trade sizes
     off what is actually free, so equity can never be double counted."""
