@@ -2790,10 +2790,16 @@ html:not(.dark) .hl-v { color: #001080; }
    per key, between the editor and the terminal so the report and its
    diagrams land together. Fixed height; the editor gives up the space. */
 .plot-strip {
-  flex: none; display: flex; gap: 8px; height: 170px; padding: 6px 8px;
+  position: relative; flex: none; display: flex; gap: 8px; height: 170px; padding: 6px 8px;
   border-top: 1px solid var(--edge); background: var(--bg);
   overflow-x: auto; overflow-y: hidden;
 }
+.plot-strip.collapsed { height: 31px; padding-top: 5px; overflow: hidden; }
+.plot-strip.collapsed .plot-pane { display: none; }
+.plot-toggle { position: absolute; top: 3px; right: 8px; z-index: 2;
+  border: 1px solid var(--edge); background: var(--bg2); color: var(--dim);
+  border-radius: 2px; padding: 2px 8px; cursor: pointer; font: inherit; font-size: 10px; }
+.plot-toggle:hover { color: var(--text); background: var(--hover); }
 .plot-pane {
   flex: 0 0 320px; min-width: 220px; display: flex; flex-direction: column;
   border: 1px solid var(--edge); border-radius: 3px; overflow: hidden;
