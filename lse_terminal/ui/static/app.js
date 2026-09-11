@@ -2623,53 +2623,85 @@ function setupLayouts() {
 /* ---------- backtest ---------- */
 
 const backtest = { engine: "python", equityChart: null, equitySeries: null };
-let backtestReportReturnFocus = null;
+/* Reports share the existing editor tab strips. Keep their transient run
+   data outside file tabs so autosave, file APIs and session restoration
+   continue to deal only with files and dataset previews. */
+const backtestReports = new Map();
+let backtestReportSeq = 0;
 
-/* Detailed strategy report. The shell owns navigation and the modal; the
-   React island owns report rendering and analytics. Keeping this bridge
-   imperative lets every existing run path (BACKTEST, IDE, WORKSPACE, and the
-   assistant) open the same report without moving their engine calls. */
-function closeBacktestReport() {
-  if (window.LSEBacktestResults) window.LSEBacktestResults.unmount();
-  const modal = $("bt-report-modal");
-  modal.classList.add("hidden");
-  if (backtestReportReturnFocus && document.contains(backtestReportReturnFocus)) {
-    backtestReportReturnFocus.focus();
-  }
-  backtestReportReturnFocus = null;
+function hideBacktestReport(editor) {
+  const session = editor === "wsx" ? wsx : py;
+  session.reportActive = null;
+  $(editor + "-main").classList.remove("report-active");
+  $(editor + "-report").classList.add("hidden");
 }
 
-function openBacktestReport(result, context = {}) {
-  if (!result || !window.LSEBacktestResults) return;
-  const modal = $("bt-report-modal");
-  if (modal.classList.contains("hidden")) backtestReportReturnFocus = document.activeElement;
-  modal.classList.remove("hidden");
-  window.LSEBacktestResults.mount($("bt-report-root"), {
-    result,
-    strategy: context.strategy || "",
-    elapsedMs: context.elapsedMs,
-    onClose: closeBacktestReport,
+function activateBacktestReport(id) {
+  const report = backtestReports.get(id);
+  if (!report) return;
+  const { editor } = report;
+  const session = editor === "wsx" ? wsx : py;
+  session.reportActive = id;
+  $(editor + "-main").classList.add("report-active");
+  const host = $(editor + "-report");
+  host.classList.remove("hidden");
+  // A fresh mount resets report-local filters when changing between runs.
+  window.LSEBacktestResults.unmount(host);
+  window.LSEBacktestResults.mount(host, {
+    result: report.result, strategy: report.strategy, elapsedMs: report.elapsedMs,
+    onClose: () => closeBacktestReport(id),
   });
-  requestAnimationFrame(() => modal.querySelector("button, [href], select, input, [tabindex]:not([tabindex='-1'])")?.focus());
+  if (editor === "wsx") wsxRenderTabs(); else renderPyTabs();
+  requestAnimationFrame(() => {
+    const tab = $(editor + "-tabs").querySelector(`[data-report-id="${id}"]`);
+    tab?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    tab?.querySelector(".report-tab-open")?.focus();
+  });
 }
 
-document.addEventListener("keydown", (e) => {
-  const modal = $("bt-report-modal");
-  if (modal.classList.contains("hidden")) return;
-  if (e.key === "Escape") {
-    e.preventDefault();
-    closeBacktestReport();
-    return;
+function closeBacktestReport(id) {
+  const report = backtestReports.get(id);
+  if (!report) return;
+  backtestReports.delete(id);
+  const { editor } = report;
+  const session = editor === "wsx" ? wsx : py;
+  if (session.reportActive === id) {
+    window.LSEBacktestResults.unmount($(editor + "-report"));
+    hideBacktestReport(editor);
+    if (editor === "py" && py.active) pyActivateTab(py.active);
+    if (editor === "wsx" && wsx.open) wsxOpen(wsx.open);
+    $(editor + "-code").focus();
   }
-  if (e.key === "Tab") {
-    const focusable = [...modal.querySelectorAll("button, [href], select, input, textarea, [tabindex]:not([tabindex='-1'])")]
-      .filter((el) => !el.disabled && el.offsetParent !== null);
-    if (!focusable.length) { e.preventDefault(); modal.focus(); return; }
-    const first = focusable[0], last = focusable[focusable.length - 1];
-    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
-    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  if (editor === "wsx") wsxRenderTabs(); else renderPyTabs();
+}
+
+function renderBacktestReportTabs(editor) {
+  const session = editor === "wsx" ? wsx : py;
+  const host = $(editor + "-tabs");
+  for (const [id, report] of backtestReports) {
+    if (report.editor !== editor) continue;
+    const tab = document.createElement("div");
+    tab.className = editor + "-tab report-tab" + (session.reportActive === id ? " active" : "");
+    tab.dataset.reportId = id;
+    const label = `Backtest ${report.number} · ${(report.strategy || report.result.symbol || "Report").split("/").pop()}`;
+    tab.title = label;
+    tab.innerHTML = `<button class="${editor}-tab-name report-tab-open" aria-pressed="${session.reportActive === id}">${mlEsc(label)}</button>` +
+      `<button class="${editor}-tab-x" title="Close report" aria-label="Close ${mlEsc(label)}">&#10005;</button>`;
+    tab.onclick = () => activateBacktestReport(id);
+    tab.querySelector(`.${editor}-tab-x`).onclick = (e) => { e.stopPropagation(); closeBacktestReport(id); };
+    host.appendChild(tab);
   }
-});
+}
+
+async function openBacktestReport(result, context = {}) {
+  if (!result || !window.LSEBacktestResults) return;
+  const editor = context.editor === "wsx" ? "wsx" : "py";
+  if (editor === "py" && $("pyide").classList.contains("hidden")) await openBacktest("py");
+  if (editor === "wsx" && $("wsx").classList.contains("hidden")) $("rail-workspace").click();
+  const number = ++backtestReportSeq, id = `report-${number}`;
+  backtestReports.set(id, { ...context, editor, number, result });
+  activateBacktestReport(id);
+}
 
 function setupBacktest() {
   $("bt-open").onclick = async () => {
@@ -13086,7 +13118,7 @@ function renderPyTabs() {
   host.innerHTML = "";
   for (const id of py.tabs) {
     const tab = document.createElement("div");
-    tab.className = "py-tab" + (id === py.active ? " active" : "");
+    tab.className = "py-tab" + (id === py.active && !py.reportActive ? " active" : "");
     tab.title = id.startsWith("data:") ? id.slice(5) : id;
     const ico = id.startsWith("data:")
       ? FILE_ICO.table : libFileIcon(id);
@@ -13103,6 +13135,7 @@ function renderPyTabs() {
     };
     host.appendChild(tab);
   }
+  renderBacktestReportTabs("py");
 }
 
 function pyActivateTab(id) {
@@ -13122,9 +13155,9 @@ function pyCloseTab(id) {
   py.tabs.splice(i, 1);
   if (py.active === id) {
     py.active = py.tabs[Math.min(i, py.tabs.length - 1)] || null;
-    if (py.active) {
+    if (py.active && !py.reportActive) {
       pyActivateTab(py.active);
-    } else {
+    } else if (!py.active) {
       // Nothing open: empty editor, like VS Code with every tab closed.
       py.open = null;
       pyIdeSetCode("");
@@ -13138,6 +13171,7 @@ function pyCloseTab(id) {
 
 /* Make id the active tab (adding it if new) and repaint the bar. */
 function pyTabActivated(id) {
+  hideBacktestReport("py");
   if (!py.tabs.includes(id)) py.tabs.push(id);
   py.active = id;
   renderPyTabs();
@@ -13157,8 +13191,8 @@ function pyPruneTabs() {
   py.tabs = py.tabs.filter(ok);
   if (py.active && !ok(py.active)) {
     py.active = py.tabs[py.tabs.length - 1] || null;
-    if (py.active) pyActivateTab(py.active);
-    else { py.open = null; pyIdeSetCode(""); pyHidePreview(); }
+    if (py.active && !py.reportActive) pyActivateTab(py.active);
+    else if (!py.active) { py.open = null; pyIdeSetCode(""); pyHidePreview(); }
   }
   if (py.tabs.length !== before) pyTabsSave();
   renderPyTabs();
@@ -13693,12 +13727,13 @@ function pyRun() {
 
 async function pyBacktest() {
   if (!py.open) return;
+  const strategy = py.open, script = $("py-code").value;
   await pySave();
   // A pinned strategy runs on ITS dataset, whatever the library pick is;
   // a missing pinned dataset is a hard stop, because falling back to the
   // ambient pick is exactly the silent-wrong-dataset bug the pin exists
   // to kill.
-  const pin = pyRunPin($("py-code").value);
+  const pin = pyRunPin(script);
   let dataset = py.dataset, pinned = false;
   if (pin) {
     if (!(state.datasetList || []).some((d) => d.symbol === pin.symbol)) {
@@ -13719,14 +13754,14 @@ async function pyBacktest() {
   btn.classList.add("running");
   btn.textContent = "RUNNING";
   const t0 = performance.now();
-  pyTermConsole().term.write(`\r\n\x1b[90m$\x1b[0m backtest ${py.open} \x1b[90mon\x1b[0m ${dataset} ${tf}${pinned ? " \x1b[90m(pinned)\x1b[0m" : ""}\r\n`);
+  pyTermConsole().term.write(`\r\n\x1b[90m$\x1b[0m backtest ${strategy} \x1b[90mon\x1b[0m ${dataset} ${tf}${pinned ? " \x1b[90m(pinned)\x1b[0m" : ""}\r\n`);
   try {
     const r = await fetch("/api/backtest", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         engine: "python", provider: "userdata", symbol: dataset,
         timeframe: tf,
-        script: $("py-code").value,
+        script,
         // Always the engine maximum; the bars input was toolbar clutter.
         // Raised together with the server cap so a run covers the full
         // bundled samples, not their last 5000 bars.
@@ -13738,7 +13773,7 @@ async function pyBacktest() {
     const res = await r.json();
     pyTermReport(res, performance.now() - t0);
     renderPlotPanes("py-plots", res.plots);
-    openBacktestReport(res, { strategy: py.open || "strategy.py", elapsedMs: performance.now() - t0 });
+    openBacktestReport(res, { editor: "py", strategy, elapsedMs: performance.now() - t0 });
     // Remember the run per script so the library's SCRIPTS chips show the
     // last result next to the file name.
     if (typeof res.net_profit === "number") {
@@ -13747,7 +13782,7 @@ async function pyBacktest() {
         // The dataset is part of the result: "-10,193 over 87 trades" means
         // nothing without knowing what it ran on, and a blind read
         // correctly refused to assume the currently-selected one.
-        runs[py.open] = { net: res.net_profit,
+        runs[strategy] = { net: res.net_profit,
                           trades: (res.trades || []).length,
                           dataset, timeframe: tf, ts: Date.now() };
         localStorage.setItem("lse.btRuns", JSON.stringify(runs));
@@ -14007,7 +14042,7 @@ function wsxRenderTabs() {
   for (const t of wsx.tabs) {
     const dirty = wsx.bufs[t] && wsx.bufs[t].dirty;
     const tab = document.createElement("div");
-    tab.className = "wsx-tab" + (t === wsx.open ? " active" : "");
+    tab.className = "wsx-tab" + (t === wsx.open && !wsx.reportActive ? " active" : "");
     tab.innerHTML = `<span class="wsx-tab-name">${mlEsc(t.split("/").pop())}</span>` +
                     `<button class="wsx-tab-x" title="Close">${dirty ? "&#9679;" : "&#215;"}</button>`;
     tab.title = t;
@@ -14015,6 +14050,7 @@ function wsxRenderTabs() {
     tab.querySelector(".wsx-tab-x").onclick = (e) => { e.stopPropagation(); wsxCloseTab(t); };
     host.appendChild(tab);
   }
+  renderBacktestReportTabs("wsx");
 }
 
 async function wsxOpen(path) {
@@ -14026,6 +14062,7 @@ async function wsxOpen(path) {
     } catch (e) { wsxShowErr(String(e.message || e)); return; }
   }
   wsx.open = path;
+  hideBacktestReport("wsx");
   if (!wsx.tabs.includes(path)) wsx.tabs.push(path);
   $("wsx-err").classList.add("hidden");
   $("wsx-empty").classList.add("hidden");
@@ -14081,7 +14118,8 @@ function wsxCloseTab(path, deleted) {
   delete wsx.bufs[path];
   if (wsx.open === path) {
     wsx.open = wsx.tabs[wsx.tabs.length - 1] || null;
-    if (wsx.open) { wsxOpen(wsx.open); return; }
+    if (wsx.open && !wsx.reportActive) { wsxOpen(wsx.open); return; }
+    if (wsx.open) { wsxRenderTabs(); return; }
     $("wsx-code").classList.add("hidden");
     $("wsx-hl").classList.add("hidden");
     $("wsx-gutter").classList.add("hidden");
@@ -14388,7 +14426,8 @@ async function wsxRunFile() {
 }
 
 async function wsxBacktest() {
-  await wsxSave(wsx.open);
+  const strategy = wsx.open, script = (wsx.bufs[strategy] || {}).content || "";
+  await wsxSave(strategy);
   // The dataset pick is shared with the BACKTEST tab (py.dataset, kept in
   // localStorage); a fresh install auto-picks the first bundled sample,
   // exactly what opening BACKTEST would do.
@@ -14396,7 +14435,7 @@ async function wsxBacktest() {
   // Same pin rule as the BACKTEST IDE: a `# run:` header outranks the
   // shared pick, and a missing pinned dataset stops the run rather than
   // silently running on the wrong data.
-  const pin = pyRunPin((wsx.bufs[wsx.open] || {}).content || "");
+  const pin = pyRunPin(script);
   let dataset = py.dataset, pinned = false;
   if (pin) {
     if (!(state.datasetList || []).some((d) => d.symbol === pin.symbol)) {
@@ -14420,14 +14459,14 @@ async function wsxBacktest() {
   if (wsx.ws) { const w = wsx.ws; wsx.ws = null; try { w.close(); } catch (e) { /* replacing */ } }
   const t = wsx.term;
   const t0 = performance.now();
-  t.write(`\r\n\x1b[90m$\x1b[0m backtest ${wsx.open} \x1b[90mon\x1b[0m ${dataset} ${tf}${pinned ? " \x1b[90m(pinned)\x1b[0m" : ""}\r\n`);
+  t.write(`\r\n\x1b[90m$\x1b[0m backtest ${strategy} \x1b[90mon\x1b[0m ${dataset} ${tf}${pinned ? " \x1b[90m(pinned)\x1b[0m" : ""}\r\n`);
   try {
     const r = await fetch("/api/backtest", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         engine: "python", provider: "userdata", symbol: dataset,
         timeframe: tf,
-        script: (wsx.bufs[wsx.open] || {}).content || "",
+        script,
         // Engine maximum, same as the BACKTEST tab: a run covers the full
         // bundled samples, not their tail.
         limit: 100000,
@@ -14438,13 +14477,13 @@ async function wsxBacktest() {
     const res = await r.json();
     pyTermReport(res, performance.now() - t0, t);
     renderPlotPanes("wsx-plots", res.plots);
-    openBacktestReport(res, { strategy: wsx.open || "strategy.py", elapsedMs: performance.now() - t0 });
+    openBacktestReport(res, { editor: "wsx", strategy, elapsedMs: performance.now() - t0 });
     // Same last-run bookkeeping as the BACKTEST tab; the library chips key
     // on the workspace path, which both editors share.
     if (typeof res.net_profit === "number") {
       try {
         const runs = btRunStats();
-        runs[wsx.open] = { net: res.net_profit,
+        runs[strategy] = { net: res.net_profit,
                            trades: (res.trades || []).length,
                            dataset, timeframe: tf, ts: Date.now() };
         localStorage.setItem("lse.btRuns", JSON.stringify(runs));
