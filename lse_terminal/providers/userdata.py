@@ -13,7 +13,9 @@ CSV exported from any broker or spreadsheet drops in unchanged.
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import time
 from io import StringIO
 from pathlib import Path
@@ -66,6 +68,20 @@ def load_manifest() -> dict:
 def _save_manifest(m: dict) -> None:
     data_dir().mkdir(parents=True, exist_ok=True)
     _manifest_path().write_text(json.dumps(m, indent=2) + "\n")
+
+
+def _write_csv_atomic(frame: pd.DataFrame, path: Path) -> None:
+    """Keep the previous dataset readable until its replacement is complete."""
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="", dir=path.parent,
+        prefix=f".{path.name}.", suffix=".tmp", delete=False,
+    )
+    try:
+        with staged:
+            frame.to_csv(staged, index=False)
+        os.replace(staged.name, path)
+    finally:
+        Path(staged.name).unlink(missing_ok=True)
 
 
 def _slug(symbol: str) -> str:
@@ -363,9 +379,9 @@ def import_csv(symbol: str, text: str, name: str = "", folder: str = "",
         # as-is with --data.
         eng = df.rename(columns={"ts": "time"}).copy()
         eng["time"] = eng["time"] * 1000
-        eng.to_csv(path, index=False)
+        _write_csv_atomic(eng, path)
     else:
-        df.to_csv(path, index=False)
+        _write_csv_atomic(df, path)
     manifest = load_manifest()
     entry = {
         "symbol": symbol,
@@ -413,9 +429,9 @@ def import_table(symbol: str, raw: pd.DataFrame, name: str = "",
     if kind == "series":
         eng = df.rename(columns={"ts": "time"}).copy()
         eng["time"] = eng["time"] * 1000
-        eng.to_csv(path, index=False)
+        _write_csv_atomic(eng, path)
     else:
-        df.to_csv(path, index=False)
+        _write_csv_atomic(df, path)
     manifest = load_manifest()
     entry = {
         "symbol": symbol,

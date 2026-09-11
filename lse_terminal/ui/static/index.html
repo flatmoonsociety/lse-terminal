@@ -516,6 +516,7 @@ def my_ind(df, length=20):
            sample, VS Code style (click a file, see the file); the click
            also picks it as the RUN dataset. Clicking any script (or the
            close button) brings the editor back. -->
+      <div id="py-report" class="backtest-report-host hidden" role="region" aria-label="Backtest report"></div>
       <div id="py-preview" class="hidden">
         <div id="py-preview-head">
           <span id="py-preview-title"></span>
@@ -828,6 +829,7 @@ def my_ind(df, length=20):
         <span class="ml-code-spacer"></span>
         <button id="wsx-run" title="Run the open file below: a strategy runs as a backtest, anything else as a script">RUN</button>
       </div>
+      <div id="wsx-report" class="backtest-report-host hidden" role="region" aria-label="Backtest report"></div>
       <div id="wsx-edwrap">
         <!-- Highlight backdrop: the textarea's text is transparent, this pre
              carries the VS Code style token colours underneath it. The

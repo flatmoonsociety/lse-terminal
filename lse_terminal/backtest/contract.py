@@ -73,6 +73,9 @@ class Trade:
     pnl: float
     pnl_pct: float
     bars_held: int
+    # Monetary value of one price point per contract.  Spot-style strategies
+    # keep the backwards-compatible default of 1.0; futures set e.g. MNQ=2.
+    point_value: float = 1.0
 
 
 @dataclass
@@ -87,6 +90,9 @@ class BacktestResult:
     trades: list[Trade] = field(default_factory=list)
     # Equity curve aligned to bars: [[ts, equity], ...].
     equity_curve: list[list[float]] = field(default_factory=list)
+    # Buy-and-hold baseline aligned to the same bars, normalized to the
+    # initial capital using the first/each bar close.
+    benchmark_curve: list[list[float]] = field(default_factory=list)
     # Series the strategy declared via `plots`: {name: [[ts, value], ...]},
     # already validated and chart-ready (runner._collect_plots).
     plots: dict = field(default_factory=dict)
@@ -99,12 +105,15 @@ class BacktestResult:
             "final_equity": self.final_equity, "net_profit": self.net_profit,
             "stats": self.stats,
             "equity_curve": self.equity_curve,
+            "benchmark_curve": self.benchmark_curve,
             "plots": self.plots,
             "trades": [
                 {"entry_ts": t.entry_ts, "exit_ts": t.exit_ts,
                  "direction": t.direction, "entry_price": t.entry_price,
                  "exit_price": t.exit_price, "qty": t.qty, "pnl": t.pnl,
-                 "pnl_pct": t.pnl_pct, "bars_held": t.bars_held}
+                 "pnl_pct": t.pnl_pct, "bars_held": t.bars_held,
+                 **({"point_value": t.point_value}
+                    if t.point_value != 1.0 else {})}
                 for t in self.trades
             ],
         }

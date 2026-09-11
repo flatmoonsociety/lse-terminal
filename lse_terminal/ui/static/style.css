@@ -1058,6 +1058,19 @@ section#charts { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 }
 #bt-results { flex: 1; display: flex; flex-direction: column; padding: 7px; gap: 5px; min-width: 0; }
 
+/* Completed runs occupy the editor area and use its existing tab strip. */
+.backtest-report-host { flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
+.backtest-report-host.hidden { display: none; }
+#py-main.report-active { min-height: 0; overflow: hidden; }
+#py-main.report-active #py-edwrap, #py-main.report-active #py-preview,
+#py-main.report-active #py-run, #py-main.report-active #py-dataset-label,
+#wsx-main.report-active #wsx-edwrap, #wsx-main.report-active #wsx-run { display: none; }
+.report-tab button:focus-visible { outline: 2px solid var(--up); outline-offset: -2px; }
+#py-bar .report-tab-open, #wsx-tabs-row .report-tab-open {
+  background: none; border: 0; color: inherit; font: inherit; letter-spacing: normal;
+  padding: 0; text-transform: none; cursor: pointer;
+}
+
 /* AI rail: full-height right panel across the whole terminal. It is a flex
    sibling of the sections inside <main>, so the active section (chart,
    backtest, my data, calendar) shrinks to make room and the rail always

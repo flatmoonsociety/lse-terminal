@@ -4553,22 +4553,31 @@ def create_app() -> FastAPI:
         return p
 
     def _ws_seed() -> None:
-        """First open: the starter strategies, so the IDE is never blank and
-        what is in it is worth reading. Seven quant strategies (the
-        single EMA-crossover starter said nothing
-        about what this terminal is for); they ship as source strings in
-        backtest/starters.py because the engine ships frozen and only code
-        in the PYZ is guaranteed to travel."""
-        if any(ws_dir().rglob("*.py")):
+        """Seed new workspaces and add the imported ATR strategy once.
+
+        The marker also remembers deletion, so listing files never restores
+        a strategy the user has removed. Source strings travel in frozen builds.
+        """
+        seeded = ws_dir() / ".atr-phase-v2-seeded"
+        if seeded.exists():
             return
+        fresh = not any(ws_dir().rglob("*.py"))
         (ws_dir() / "strategies").mkdir(exist_ok=True)
         try:
             from lse_terminal.backtest.starters import STARTERS
         except Exception:
             STARTERS = ()
         for fname, source in STARTERS:
-            (ws_dir() / "strategies" / fname).write_text(source)
-        if not STARTERS:   # never leave the IDE with nothing to open
+            if not fresh and fname != "atr_normalized_phase_momentum.py":
+                continue
+            try:
+                with (ws_dir() / "strategies" / fname).open("x", encoding="utf-8") as f:
+                    f.write(source)
+            except FileExistsError:
+                pass  # preserve user edits, including concurrent first opens
+        if STARTERS:
+            seeded.touch()
+        elif fresh:   # never leave the IDE with nothing to open
             try:
                 template = reg.engine("python").template()
             except Exception:
@@ -5181,11 +5190,12 @@ def create_app() -> FastAPI:
     # the lse-data SDK, then lands it in the library like any local upload.
     # Pulls run in a thread: the SDK's submit/poll/download is blocking by
     # design (the vault builds the file server side), and a deep tick pull is
-    # minutes-long. Job state is in-memory only; the terminal is single-user
-    # and a restart mid-pull just means pressing Download again (the vault
-    # job cache makes the retry cheap server side).
+    # minutes-long. UI jobs live in memory; export IDs and verified chunks are
+    # checkpointed on disk so Download resumes them after an interruption.
 
+    import threading
     lsebank_jobs: dict[str, dict] = {}
+    lsebank_jobs_lock = threading.Lock()
 
     def _lse_bank():
         p = _lse_for_options()  # same guard: provider present + key set
@@ -5259,11 +5269,17 @@ def create_app() -> FastAPI:
         dataset = body.dataset.strip()
         if not dataset:
             raise HTTPException(400, "dataset required")
-        job_id = _uuid.uuid4().hex[:12]
-        job = {"id": job_id, "status": "exporting",
-               "detail": "the vault is building your file",
-               "dataset": dataset, "symbol": body.symbol}
-        lsebank_jobs[job_id] = job
+        request_key = (dataset, body.symbol, body.timeframe, body.start, body.end, body.folder)
+        with lsebank_jobs_lock:
+            for active in lsebank_jobs.values():
+                if (active.get("request") == request_key
+                        and active["status"] in ("exporting", "importing")):
+                    return {"job_id": active["id"]}
+            job_id = _uuid.uuid4().hex[:12]
+            job = {"id": job_id, "status": "exporting",
+                   "detail": "checking the vault export allowance",
+                   "dataset": dataset, "symbol": body.symbol, "request": request_key}
+            lsebank_jobs[job_id] = job
         # Display name from the (SDK-cached) catalog so the library row reads
         # "Bitcoin", not just the ticker. Best-effort: a miss keeps the symbol.
         disp = ""
@@ -5276,14 +5292,68 @@ def create_app() -> FastAPI:
         def run():
             dl_dir = userdata.data_dir() / "lse"
             path = None
+            merged_path = None
             try:
-                kwargs = dict(start=body.start or None, end=body.end or None,
-                              dest=str(dl_dir), dataframe=False)
-                if body.symbol:
-                    path = c.history(body.symbol, dataset=dataset,
-                                     timeframe=body.timeframe or "tick", **kwargs)
+                from lse_terminal.providers.vault_import import (
+                    candle_ranges, export_file, validate_candles,
+                    validate_chunk_edges, validate_coverage,
+                )
+                timeframe = body.timeframe or "tick"
+                cache_dir = dl_dir / ".exports"
+                # Bound every futures candle artifact below the observed 2.5m
+                # row ceiling. All export types share quota and resume handling.
+                chunked = bool(body.symbol and timeframe != "tick" and dataset == "futures")
+                if chunked:
+                    catalog_row = next((r for r in c.datasets(dataset)
+                                        if r.get("symbol") == body.symbol), {})
+                    first = body.start or str(catalog_row.get("first_tick") or "")[:10]
+                    last = body.end or str(catalog_row.get("last_tick") or "")[:10]
+                    if not first or not last:
+                        raise ValueError("the futures catalog has no complete date range")
+                    specs = list(candle_ranges(first, last, timeframe))
+                    job.update(chunks_total=len(specs), chunks_done=0,
+                               detail=f"downloading {len(specs)} history chunks")
+                    frames = []
+                    for start, end in specs:
+                        payload = {"dataset": dataset, "symbol": body.symbol,
+                                   "timeframe": timeframe, "start": start,
+                                   "end": end, "format": "parquet"}
+                        latest = c.candles(body.symbol, dataset=dataset, timeframe=timeframe,
+                                           start=start, end=end, order="desc", limit=1)
+                        # Reuse closed chunks, but refresh a growing tail even
+                        # when the provider's catalog has not caught up yet.
+                        snapshot = str(latest[0].get("timestamp", latest[0].get("ts"))) if latest else "empty"
+                        chunk = export_file(c, payload, cache_dir, job.update,
+                                            snapshot=snapshot)
+                        frame = pd.read_parquet(chunk)
+                        validate_candles(frame, start, end, timeframe)
+                        validate_chunk_edges(c, payload, frame)
+                        frames.append(frame)
+                        job.update(chunks_done=len(frames),
+                                   detail=f"validated {len(frames)}/{len(specs)} history chunks")
+                    raw = pd.concat(frames, ignore_index=True).sort_values("ts").reset_index(drop=True)
+                    del frames
+                    if raw["ts"].duplicated().any():
+                        raise ValueError("vault chunks overlap; existing library file preserved")
+                    validate_coverage(raw, catalog_row, timeframe, body.start, body.end)
+                    job.update(rows=len(raw), first_timestamp=str(raw["ts"].min()),
+                               last_timestamp=str(raw["ts"].max()))
+                    merged_path = dl_dir / f"{job_id}-merged.parquet"
+                    raw.to_parquet(merged_path, index=False)
+                    del raw
+                    path = merged_path
                 else:
-                    path = c.dataset(dataset, **kwargs)
+                    payload = {"dataset": dataset, "start": body.start or None,
+                               "end": body.end or None, "format": "parquet"}
+                    if body.symbol:
+                        payload.update(symbol=body.symbol, timeframe=timeframe)
+                    # Match the published source snapshot so retries survive
+                    # hourly quota resets and new published data refreshes it.
+                    catalog = c.datasets(dataset) if body.symbol else c.reference()
+                    source = next((r for r in catalog if
+                                   r.get("symbol") == body.symbol) , {}) if body.symbol else catalog
+                    path = export_file(c, payload, cache_dir, job.update,
+                                       snapshot=json.dumps(source, sort_keys=True))
                 size = os.path.getsize(path)
                 job.update(status="importing", bytes=size,
                            detail="download done, importing to the library")
@@ -5318,21 +5388,18 @@ def create_app() -> FastAPI:
                     folder=body.folder, source_ext=".parquet")
                 job.update(status="done", entry=entry,
                            detail=f"imported {entry['rows']} rows")
-                os.remove(path)  # library keeps its own copy
+                if merged_path:
+                    merged_path.unlink(missing_ok=True)
             except userdata.ImportError_ as e:
-                # Not chartable as candles/series: the Parquet itself is the
-                # deliverable. Point the user at the file we kept.
+                # Unchartable exports remain available as Parquet, as before.
                 if path and os.path.exists(path):
                     job.update(status="saved", path=str(path),
                                detail=f"saved as a Parquet file ({e})")
                 else:
-                    job.update(status="failed", error=(getattr(e, "message", None) or str(e))[:300])
+                    job.update(status="failed", error=str(e)[:300])
             except Exception as e:
-                if path and os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
+                # Retain checked chunks and provider IDs for the next Download.
+                # The previous library file is untouched until import commits.
                 job.update(status="failed", error=(getattr(e, "message", None) or str(e))[:300])
 
         threading.Thread(target=run, daemon=True,

@@ -49,7 +49,8 @@ Keys are read liberally because this is the one place the user has to match us:
 ``exit_price``; ``qty``/``size``. Direction defaults to long. Prices default to
 the open of the named bar, which is the honest fill for a decision made on the
 bar before. Size defaults to the full account, compounding trade to trade;
-give ``qty`` for an absolute quantity instead.
+give ``qty`` for an absolute quantity instead. ``point_value`` (default 1)
+sets the monetary value of one price point per contract for futures.
 
 We do the part after the run: sizing, commission, the per-bar equity curve,
 drawdown, sharpe and the rest. That is deliberately ours, because it is the
@@ -329,11 +330,14 @@ class PythonRunner(BacktestEngine):
         # Per-run deadline; walk-forward therefore bounds each fold, not the
         # whole sweep, which is the behaviour a param grid needs.
         timeout = float(options.get("timeout") or _DEFAULT_TIMEOUT)
-        raw, plots = self._execute(script, df, options.get("params") or {},
-                                   self._load_datasets(data_files), timeout)
+        raw, plots = self._execute(
+            script, df, options.get("params") or {},
+            self._load_datasets(data_files), timeout,
+            symbol=symbol, timeframe=timeframe)
         trades = self._normalize(raw, df)
         equity_curve, final_equity, bars_in_market = self._account(
             trades, df, capital, commission_pct / 100.0)
+        benchmark_curve = self._benchmark_curve(df, capital)
 
         stats = self._stats(trades, equity_curve, capital, final_equity,
                             bars_in_market, bool(options.get("extended_stats")))
@@ -342,12 +346,33 @@ class PythonRunner(BacktestEngine):
             initial_capital=capital, final_equity=final_equity,
             net_profit=final_equity - capital,
             stats=stats, trades=trades, equity_curve=equity_curve,
-            plots=plots,
+            benchmark_curve=benchmark_curve, plots=plots,
         )
+
+    @staticmethod
+    def _benchmark_curve(df: pd.DataFrame, capital: float) -> list[list[float]]:
+        """Normalize a buy-and-hold close series to the starting capital.
+
+        The first close is the baseline and each later point is marked at its
+        close. This is a visual comparison only; it never affects strategy
+        accounting, fees, or the reported final equity.
+        """
+        if df is None or len(df) == 0:
+            return []
+        closes = df["close"].to_numpy(dtype="float64")
+        first = float(closes[0])
+        if not math.isfinite(first) or first == 0.0:
+            return []
+        ts = df["ts"].to_numpy(dtype="int64")
+        return [[int(t), float(capital * (close / first))]
+                for t, close in zip(ts, closes)
+                if math.isfinite(float(close))]
 
     def _execute(self, script: str, df: pd.DataFrame, params: dict,
                  datasets: dict,
-                 timeout: float = _DEFAULT_TIMEOUT) -> tuple[list, dict]:
+                 timeout: float = _DEFAULT_TIMEOUT,
+                 symbol: str | None = None,
+                 timeframe: str | None = None) -> tuple[list, dict]:
         """Run the script with the data in scope; hand back its `trades`
         and its optional `plots`, chart-ready.
 
@@ -367,6 +392,10 @@ class PythonRunner(BacktestEngine):
             "df": df,
             "params": dict(params),
             "data": datasets,
+            # Selected chart context, available to instrument-aware strategy
+            # wrappers.  Optional args preserve direct _execute callers.
+            "symbol": symbol,
+            "timeframe": timeframe,
         }
         try:
             # The deadline is the only thing standing between a `while True`
@@ -507,6 +536,17 @@ class PythonRunner(BacktestEngine):
                 raise BacktestError(
                     f"trade {k} has entry price {entry_price}; must be > 0")
 
+            raw_point_value = _pick(t, "point_value", "pointValue",
+                                    "multiplier", default=1.0)
+            try:
+                point_value = float(raw_point_value)
+            except (TypeError, ValueError):
+                raise BacktestError(
+                    f"trade {k} has point_value {raw_point_value!r}; must be a finite value > 0") from None
+            if not math.isfinite(point_value) or point_value <= 0:
+                raise BacktestError(
+                    f"trade {k} has point_value {point_value}; must be a finite value > 0")
+
             qty = _pick(t, "qty", "size")
             out.append(Trade(
                 entry_ts=int(ts[entry_i]), exit_ts=int(ts[exit_i]),
@@ -515,6 +555,7 @@ class PythonRunner(BacktestEngine):
                 qty=float(qty) if qty is not None else float("nan"),
                 pnl=0.0, pnl_pct=0.0,          # filled by _account
                 bars_held=int(exit_i - entry_i),
+                point_value=point_value,
             ))
             # The bar indexes are needed by the accounting pass and are not
             # part of the public Trade shape, so they ride alongside.
@@ -580,8 +621,11 @@ class PythonRunner(BacktestEngine):
         for k, t in enumerate(trades):
             events.append((t._entry_i, k, "entry"))    # type: ignore
             events.append((t._exit_i, k, "exit"))      # type: ignore
-        # Exits before entries on the same bar: freed capital is reusable.
-        events.sort(key=lambda e: (e[0], 0 if e[2] == "exit" else 1))
+        # Close existing positions first so their capital can be reused. A
+        # same-bar round trip must still enter before its own exit.
+        events.sort(key=lambda e: (
+            e[0], 0 if e[2] == "exit" and trades[e[1]]._entry_i < e[0] else 1,
+            e[1], 0 if e[2] == "entry" else 1))
 
         committed = 0.0
         sized: dict[int, float] = {}
@@ -590,13 +634,13 @@ class PythonRunner(BacktestEngine):
             if kind == "entry":
                 free = max(0.0, cash - committed)
                 if math.isnan(t.qty):
-                    qty = free / t.entry_price if t.entry_price > 0 else 0.0
+                    qty = free / (t.entry_price * t.point_value)
                 else:
                     qty = t.qty
                 if not math.isfinite(qty) or qty <= 0:
                     qty = 0.0
                 sized[k] = qty
-                notional = t.entry_price * qty
+                notional = t.entry_price * qty * t.point_value
                 committed += notional
                 fee = notional * commission_rate
                 cash -= fee
@@ -604,15 +648,15 @@ class PythonRunner(BacktestEngine):
             else:
                 qty = sized.get(k, 0.0)
                 if t.direction == "long":
-                    gross = (t.exit_price - t.entry_price) * qty
+                    gross = (t.exit_price - t.entry_price) * qty * t.point_value
                 else:
-                    gross = (t.entry_price - t.exit_price) * qty
-                fee = t.exit_price * qty * commission_rate
-                entry_fee = t.entry_price * qty * commission_rate
+                    gross = (t.entry_price - t.exit_price) * qty * t.point_value
+                fee = t.exit_price * qty * t.point_value * commission_rate
+                entry_fee = t.entry_price * qty * t.point_value * commission_rate
                 cash += gross - fee
                 realized[bar] += gross - fee
-                committed -= t.entry_price * qty
-                notional = t.entry_price * qty
+                committed -= t.entry_price * qty * t.point_value
+                notional = t.entry_price * qty * t.point_value
                 t.qty = float(qty)
                 t.pnl = float(gross - fee - entry_fee)
                 t.pnl_pct = float(t.pnl / notional * 100.0) if notional else 0.0
@@ -634,9 +678,9 @@ class PythonRunner(BacktestEngine):
                 t = trades[k]
                 qty = sized.get(k, 0.0)
                 if t.direction == "long":
-                    unreal += (close[i] - t.entry_price) * qty
+                    unreal += (close[i] - t.entry_price) * qty * t.point_value
                 else:
-                    unreal += (t.entry_price - close[i]) * qty
+                    unreal += (t.entry_price - close[i]) * qty * t.point_value
             if open_at[i]:
                 bars_in_market += 1
             equity_curve.append([int(ts[i]), float(running + unreal)])
