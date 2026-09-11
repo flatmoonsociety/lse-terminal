@@ -28,5 +28,6 @@ tests/data/ts_truth.json
 lse_terminal/ui/static/assets/news/
 lse_terminal/ui/static/assets/research/
 .wvenv/
+.dev-data/
 desktop/build-*.log
 desktop/*.log

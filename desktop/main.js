@@ -31,10 +31,24 @@ const os = require("os");
 // workspace, imports, chats), never the public app's.
 const CHANNEL = (() => { try { return require("./package.json").lseChannel || "public"; } catch { return "public"; } })();
 const IS_DEMO = CHANNEL === "demo";
-const APP_TITLE = IS_DEMO ? "LSE Demo Terminal" : "LSE Terminal";
-// Same path the engine's config_dir() resolves on every OS; the demo app
-// hands its own folder to the engine through LSE_TERMINAL_CONFIG_DIR.
-const CONFIG_DIR = path.join(os.homedir(), ".config", IS_DEMO ? "lse-terminal-demo" : "lse-terminal");
+const IS_DEV = !app.isPackaged;
+const APP_TITLE = (IS_DEMO ? "LSE Demo Terminal" : "LSE Terminal") + (IS_DEV ? " Dev" : "");
+const DEV_DATA = path.join(__dirname, "..", ".dev-data");
+const configOverride = process.env.LSE_TERMINAL_CONFIG_DIR;
+// Captures and the engine must use the same config folder, including overrides.
+const CONFIG_DIR = configOverride
+  ? path.resolve(configOverride.replace(/^~(?=$|[\\/])/, () => os.homedir()))
+  : IS_DEV ? path.join(DEV_DATA, IS_DEMO ? "config-demo" : "config")
+    : path.join(os.homedir(), ".config", IS_DEMO ? "lse-terminal-demo" : "lse-terminal");
+
+// Isolate Chromium storage and the instance lock before either is initialized.
+if (IS_DEV) {
+  const profile = path.join(DEV_DATA, IS_DEMO ? "electron-demo" : "electron");
+  fs.mkdirSync(profile, { recursive: true });
+  app.setName(APP_TITLE);
+  app.setPath("userData", profile);
+  app.setPath("sessionData", profile);
+}
 
 let sidecar = null;
 let win = null;
@@ -64,19 +78,20 @@ function devConfig() {
 }
 
 // Packaged: resources/sidecar/lset-server/<exe> (PyInstaller onedir).
-// Dev tree: prefer a local frozen build in desktop/sidecar, else the venv.
+// Source runs always use this checkout's editable virtual environment.
 function sidecarCommand() {
+  if (IS_DEV) {
+    const venv = path.join(__dirname, "..", ".venv");
+    const cmd = process.platform === "win32"
+      ? path.join(venv, "Scripts", "lset.exe") : path.join(venv, "bin", "lset");
+    return { cmd, args: [], cwd: path.join(__dirname, ".."), dev: true };
+  }
   const dev = devConfig();
   if (dev && dev.command) {
     return { cmd: dev.command, args: dev.args || [], cwd: dev.cwd, dev: true };
   }
   const exe = process.platform === "win32" ? "lset-server.exe" : "lset-server";
-  const packaged = path.join(process.resourcesPath, "sidecar", "lset-server", exe);
-  if (app.isPackaged) return { cmd: packaged, args: [] };
-  const devFrozen = path.join(__dirname, "sidecar", "lset-server", exe);
-  if (fs.existsSync(devFrozen)) return { cmd: devFrozen, args: [] };
-  const devLset = path.join(__dirname, "..", ".venv", "bin", "lset");
-  return { cmd: devLset, args: [] };
+  return { cmd: path.join(process.resourcesPath, "sidecar", "lset-server", exe), args: [] };
 }
 
 // macOS only: an app launched from Finder inherits launchd's minimal PATH
@@ -140,7 +155,7 @@ function waitForHealth(port, timeoutMs) {
 // That turned into a 5-crash loop and a fatal "stopped repeatedly (code 1)"
 // dialog, so the shell now probes for a genuinely free port
 // before every spawn instead of assuming 7799.
-const PREFERRED_PORT = 7799;
+const PREFERRED_PORT = IS_DEV ? 7787 : 7799;
 let currentPort = PREFERRED_PORT;
 let engineRestarts = 0;
 
@@ -325,7 +340,7 @@ function spawnSidecar() {
            // The engine reads the channel too (the demo app fetches the
            // staging directory, see broker_hub.DIRECTORY_URL).
            LSE_TERMINAL_CHANNEL: CHANNEL,
-           ...(IS_DEMO ? { LSE_TERMINAL_CONFIG_DIR: CONFIG_DIR } : {}) },
+           LSE_TERMINAL_CONFIG_DIR: CONFIG_DIR },
   });
   sidecar.on("error", (e) => recordEngineOutput(`[shell] spawn error: ${e}\n`));
   // Drain the pipes: an unread pipe can fill and stall the engine, and the
@@ -407,10 +422,9 @@ async function start() {
     webPreferences: { contextIsolation: true, nodeIntegration: false,
                       preload: path.join(__dirname, "preload.js") },
   });
-  // The page names itself "... · LSE Terminal" in document.title; the demo
-  // app rewrites that so the title bar and taskbar say which app this is.
+  // Keep the demo/development identity when the page updates its title.
   win.on("page-title-updated", (e, title) => {
-    if (!IS_DEMO) return;
+    if (!IS_DEMO && !IS_DEV) return;
     e.preventDefault();
     win.setTitle(title.replace(/LSE Terminal/g, APP_TITLE));
   });

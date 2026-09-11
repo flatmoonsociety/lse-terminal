@@ -21,7 +21,10 @@
 // ============================================================================
 
 import { createRequire } from 'module';
-import { readFileSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { dirname, join, resolve } from 'path';
+import { fileURLToPath } from 'url';
 
 // This repo deliberately ships no node browser deps of its own; resolve
 // puppeteer-core from wherever the machine has it: LSE_SMOKE_PUPPETEER_DIR
@@ -32,7 +35,7 @@ for (const seed of [
   process.env.LSE_SMOKE_PUPPETEER_DIR,
   `${process.cwd()}/package.json`,
   // globalThis: the CLI's URL const below shadows the global in module scope.
-  new globalThis.URL('../frontend/package.json', import.meta.url).pathname,
+  fileURLToPath(new globalThis.URL('../frontend/package.json', import.meta.url)),
 ].filter(Boolean)) {
   try { puppeteer = createRequire(seed)('puppeteer-core'); break; } catch { /* next */ }
 }
@@ -41,7 +44,21 @@ if (!puppeteer) {
   process.exit(1);
 }
 
-const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable';
+const browserCandidates = process.platform === 'win32'
+  ? [process.env.PROGRAMFILES, process.env['PROGRAMFILES(X86)'], process.env.LOCALAPPDATA]
+      .filter(Boolean)
+      .flatMap(base => [join(base, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+                        join(base, 'Microsoft', 'Edge', 'Application', 'msedge.exe')])
+  : process.platform === 'darwin'
+    ? ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+       '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge']
+    : ['/usr/bin/google-chrome-stable', '/usr/bin/google-chrome',
+       '/usr/bin/chromium', '/usr/bin/chromium-browser'];
+const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || browserCandidates.find(p => existsSync(p));
+if (!CHROMIUM_PATH) {
+  console.error('FAIL: Chrome or Edge not found; set PUPPETEER_EXECUTABLE_PATH to a Chromium browser executable');
+  process.exit(1);
+}
 const URL = process.argv.find(a => a.startsWith('--url='))?.slice(6) || 'http://127.0.0.1:7788/';
 const BUNDLE = process.argv.find(a => a.startsWith('--bundle='))?.slice(9) || null;
 
@@ -50,20 +67,18 @@ function fail(msg) { console.error(`FAIL: ${msg}`); process.exitCode = 1; }
 const pageErrors = [];
 const consoleErrors = [];
 
-// Profile per uid: a shared 700-mode profile dir kills the second user's
-// Chrome mid-navigation.
-import { mkdirSync } from 'fs';
-const profile = `/tmp/lse-chart-smoke-profile-${process.getuid()}`;
-mkdirSync(profile, { recursive: true });
-
-const browser = await puppeteer.launch({
-  executablePath: CHROMIUM_PATH,
-  headless: 'new',
-  userDataDir: profile,
-  args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-first-run'],
-});
+// A fresh platform-native profile also keeps simultaneous runs independent.
+const profileRoot = resolve(tmpdir());
+const profile = mkdtempSync(join(profileRoot, 'lse-chart-smoke-'));
+let browser;
 
 try {
+  browser = await puppeteer.launch({
+    executablePath: CHROMIUM_PATH,
+    headless: 'new',
+    userDataDir: profile,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-first-run'],
+  });
   const page = await browser.newPage();
   await page.setViewport({ width: 1440, height: 900 });
   page.on('pageerror', e => pageErrors.push(String(e?.message || e)));
@@ -173,5 +188,11 @@ try {
   if (pageErrors.length) console.error(`page errors:\n  ${pageErrors.join('\n  ')}`);
   if (consoleErrors.length) console.error(`console errors:\n  ${consoleErrors.join('\n  ')}`);
 } finally {
-  await browser.close();
+  try {
+    await browser?.close();
+  } finally {
+    // Remove only the temporary directory allocated by this invocation.
+    if (dirname(resolve(profile)) !== profileRoot) throw new Error('unexpected smoke profile path');
+    rmSync(profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  }
 }

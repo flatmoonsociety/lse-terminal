@@ -65,7 +65,8 @@ the background and installs them the next time it opens.
 
 ## From source
 
-You need Python 3.10 or newer and Node 20 or newer.
+You need Python 3.10 or newer and Node 20 or newer (Node 22.12 or newer is
+required for the Electron desktop dependencies).
 
 ```
 git clone https://github.com/londonstrategicedge/lse-terminal.git
@@ -80,6 +81,29 @@ python -m venv .venv
 `lset` starts the engine and opens the terminal in a browser tab. The
 installers are built with `desktop/build-mac.sh` and
 `desktop/build-win.ps1`. Tests: `.venv/bin/python -m pytest tests/`
+
+### Windows development
+
+Clone `brue` and `brue-connect` beside this checkout, then run the setup from
+PowerShell:
+
+```powershell
+Set-Location E:\Code\lse-terminal
+.\tools\dev.ps1
+```
+
+This creates `.venv`, installs the three repositories in editable mode, builds
+the React chart into the Python static directory, and starts the local engine
+at `http://127.0.0.1:7787`. Development data is kept under `.dev-data`, so the
+installed application's account, workspace, and chats are not used. Add
+`-Desktop` to open the source Electron shell with the same isolated profile.
+
+Backend checks:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests
+node --test desktop\main.test.js
+```
 
 ## Files
 
