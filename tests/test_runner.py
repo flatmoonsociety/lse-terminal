@@ -128,6 +128,66 @@ def test_explicit_prices_and_qty_are_honoured(runner):
     assert res.net_profit == pytest.approx(30.0)
 
 
+def test_futures_point_value_scales_pnl_mark_to_market_and_notional(runner):
+    """A one-contract futures trade pays its contract point value per price
+    point, including sizing, fees and the open-position mark."""
+    df = candles(n=4)
+    df["open"] = [100.0, 101.0, 103.0, 104.0]
+    df["close"] = [100.0, 102.0, 103.0, 104.0]
+    result = runner.run(
+        'trades = [{"entry_i": 0, "exit_i": 3, "qty": 1, "point_value": 2}]',
+        df, "MNQ", "1m", options={"commission_pct": 1.0})
+    # 4 points * 2 dollars/point, less 1% commission on the 200-dollar
+    # entry notional and 208-dollar exit notional.
+    assert result.trades[0].pnl == pytest.approx(3.92)
+    assert result.net_profit == pytest.approx(3.92)
+    assert result.equity_curve[1][1] == pytest.approx(100_002.0)
+    assert result.trades[0].point_value == 2.0
+    assert result.to_json()["trades"][0]["point_value"] == 2.0
+
+
+def test_default_futures_size_uses_contract_notional(runner):
+    result = runner.run(
+        'trades = [{"entry_i": 0, "exit_i": 2, "entry": 100, "exit": 110, '
+        '"point_value": 20}]', candles(n=3), "NQ", "1m",
+        options={"capital": 10_000})
+    assert result.trades[0].qty == pytest.approx(5.0)
+    assert result.net_profit == pytest.approx(1_000.0)
+
+
+def test_same_bar_round_trip_realizes_fees_and_releases_capital(runner):
+    result = runner.run(
+        'trades = ['
+        '{"entry_i": 0, "exit_i": 1, "entry": 100, "exit": 110, "point_value": 2},'
+        '{"entry_i": 1, "exit_i": 1, "entry": 100, "exit": 105, "point_value": 2},'
+        '{"entry_i": 1, "exit_i": 2, "entry": 100, "exit": 100, "point_value": 2}'
+        ']', candles(n=3), "MNQ", "1m",
+        options={"capital": 1_000, "commission_pct": 1.0})
+    # Existing position closes for 1,079; the same-bar trade pays both fees,
+    # earns 5%, and leaves 1,110.8305 available for the following entry.
+    assert [t.qty for t in result.trades] == pytest.approx(
+        [5.0, 5.395, 5.5541525])
+    assert [t.pnl for t in result.trades] == pytest.approx(
+        [79.0, 31.8305, -22.21661])
+    assert result.final_equity == pytest.approx(1_088.61389)
+    assert sum(t.pnl for t in result.trades) == pytest.approx(result.net_profit)
+    assert result.equity_curve[-1][1] == pytest.approx(result.final_equity)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "float('nan')", "float('inf')"])
+def test_point_value_must_be_finite_and_positive(runner, value):
+    script = f'trades = [{{"entry_i": 0, "exit_i": 1, "point_value": {value}}}]'
+    with pytest.raises(BacktestError, match="point_value.*finite.*> 0"):
+        runner.run(script, candles(), "MNQ", "1m")
+
+
+def test_strategy_receives_selected_symbol_and_timeframe(runner):
+    script = ('assert symbol == "MNQ"\n'
+              'assert timeframe == "1m"\n'
+              'trades = []')
+    runner.run(script, candles(), "MNQ", "1m")
+
+
 def test_trades_may_be_a_dataframe(runner):
     res = runner.run(
         'import pandas as pd\n'

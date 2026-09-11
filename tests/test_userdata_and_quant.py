@@ -408,3 +408,48 @@ def test_clean_prices_left_untouched(client):
     df = pd.read_csv(userdata.data_dir() / entry["file"])
     assert list(df["open"]) == [1.08123, 1.08125]
     assert list(df["close"]) == [1.08125, 1.08133]
+
+
+@pytest.mark.parametrize("table", [False, True], ids=["csv", "table"])
+@pytest.mark.parametrize("kind", ["ohlcv", "series"])
+def test_failed_reimport_preserves_dataset(tmp_path, monkeypatch, table, kind):
+    from io import StringIO
+
+    import pandas as pd
+    from lse_terminal.providers import userdata
+
+    monkeypatch.setenv("LSE_TERMINAL_CONFIG_DIR", str(tmp_path))
+
+    def import_rows(count):
+        raw = pd.read_csv(StringIO(rising_csv(count)))
+        if kind == "series":
+            raw = raw[["time", "close"]]
+        if table:
+            return userdata.import_table("NQ_F_1M", raw, kind=kind)
+        return userdata.import_csv("NQ_F_1M", raw.to_csv(index=False), kind=kind)
+
+    entry = import_rows(3)
+    path = userdata.data_dir() / entry["file"]
+    original = path.read_bytes()
+    manifest = userdata.load_manifest()
+    to_csv = pd.DataFrame.to_csv
+
+    def fail_while_writing(frame, destination=None, *args, **kwargs):
+        if destination is None:  # The CSV API still needs its input string.
+            return to_csv(frame, destination, *args, **kwargs)
+        destination.write("partially serialized replacement")
+        assert path.read_bytes() == original
+        raise OSError("disk full")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pd.DataFrame, "to_csv", fail_while_writing)
+        with pytest.raises(OSError, match="disk full"):
+            import_rows(6)
+
+    assert path.read_bytes() == original
+    assert userdata.load_manifest() == manifest
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+    replacement = import_rows(6)
+    assert replacement["rows"] == len(pd.read_csv(path)) == 6
+    assert userdata.load_manifest()["NQ_F_1M"] == replacement

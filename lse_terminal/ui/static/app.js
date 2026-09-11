@@ -7628,7 +7628,9 @@ function lsbWatch(jobId) {
       job = await r.json();
     } catch (e) { return; }
     if (job.status === "exporting" || job.status === "importing") {
-      st.textContent = job.detail || job.status;
+      const chunks = job.chunks_total ? `${job.chunks_done || 0}/${job.chunks_total} chunks · ` : "";
+      const wait = job.retry_at ? Math.max(0, Math.ceil(job.retry_at - Date.now() / 1000)) : 0;
+      st.textContent = chunks + (job.detail || job.status) + (wait ? ` (${wait}s)` : "");
       return;
     }
     clearInterval(lsb.timer);
@@ -13762,10 +13764,8 @@ async function pyBacktest() {
         engine: "python", provider: "userdata", symbol: dataset,
         timeframe: tf,
         script,
-        // Always the engine maximum; the bars input was toolbar clutter.
-        // Raised together with the server cap so a run covers the full
-        // bundled samples, not their last 5000 bars.
-        limit: 100000,
+        // Local history runs in full; a positive limit would select its tail.
+        limit: 0,
         options: { extended_stats: true },
       }),
     });
@@ -14467,9 +14467,8 @@ async function wsxBacktest() {
         engine: "python", provider: "userdata", symbol: dataset,
         timeframe: tf,
         script,
-        // Engine maximum, same as the BACKTEST tab: a run covers the full
-        // bundled samples, not their tail.
-        limit: 100000,
+        // Local history runs in full, matching the BACKTEST tab.
+        limit: 0,
         options: { extended_stats: true },
       }),
     });

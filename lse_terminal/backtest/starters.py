@@ -2,15 +2,15 @@
 
 The workspace used to seed ONE file, an EMA 9/21
 crossover, which is the toy every charting package ships and says nothing
-about what this terminal is for. These seven are quant strategies: each one
-states the effect it is trying to harvest, measures the regime it needs, and
-sizes or gates itself accordingly.
+about what this terminal is for. The bundled quant strategies each
+state the effect they are trying to harvest, measure the regime they need, and
+size or gate themselves accordingly.
 
 They are held as source STRINGS rather than .py files in the package because
 the engine ships frozen (PyInstaller): code in the PYZ always travels, loose
 data files only travel if the spec lists them.
 
-House rules every one of these follows, because a starter people copy is a
+House rules for the original quant starters, because a starter people copy is a
 house style whether you meant it or not:
 
   * Decide on bar i, fill at bar i+1's open. Nothing reads a price it could
@@ -25,6 +25,8 @@ house style whether you meant it or not:
     spacing. A lookback written in bars means eight days on hourly gold and
     eight months on daily Apple, which is how one file quietly becomes two
     different strategies; every starter measures the bar first.
+
+The imported ATR phase strategy preserves its NinjaTrader bar-based periods.
 """
 
 VOL_TARGET_TREND = '''# Volatility-Targeted Trend
@@ -708,6 +710,9 @@ plots = {"stretch z": z, "kill-switch equity": eq_pts}
 '''
 
 
+from lse_terminal.backtest.atr_phase import STARTER as ATR_PHASE
+
+
 # Seeded into workspace strategies/ on first open, in this order.
 STARTERS = (
     ("vol_targeted_trend.py", VOL_TARGET_TREND),
@@ -717,4 +722,5 @@ STARTERS = (
     ("tsmom_multi_horizon.py", TSMOM_MULTI),
     ("kalman_slope_trend.py", KALMAN_SLOPE),
     ("ensemble_kill_switch.py", ENSEMBLE_KILL_SWITCH),
+    ("atr_normalized_phase_momentum.py", ATR_PHASE),
 )
