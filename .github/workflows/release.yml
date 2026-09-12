@@ -198,7 +198,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-        with: { ref: "${{ inputs.tag || github.ref }}" }
+        # Build inputs stay at the release tag; assembly fixes come from the
+        # workflow revision so a manual retry can repair packaging metadata.
+        with: { ref: "${{ github.workflow_sha }}" }
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
       - name: Install release metadata tools
