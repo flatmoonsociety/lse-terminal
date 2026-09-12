@@ -200,11 +200,10 @@ function findFreePort(start, tries) {
   });
 }
 
-// Auto-update: releases live at terminal.londonstrategicedge.com/releases/
+// Auto-update: releases live on the flatmoonsociety/lse-terminal GitHub fork.
 // (the generic provider URL in package.json "publish"; electron-builder
-// bakes it into resources/app-update.yml). electron-updater cache-busts
-// latest.yml itself and the origin serves it Cache-Control: no-store, so a
-// new release is seen on the very next check, never a stale cached copy.
+// bakes it into resources/app-update.yml). The latest/download redirect
+// resolves update metadata and installers from the latest published release.
 // Downloads happen in the background; the user picks restart-now or
 // next-quit (autoInstallOnAppQuit), so an update can never block work.
 let autoUpdater = null;   // null = this build has no updater (dev, mac, no dep)

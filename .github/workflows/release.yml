@@ -1,7 +1,7 @@
-# Release builds on GitHub-hosted runners: push a tag like v0.0.2 and both
+# Release builds on GitHub-hosted runners: push a version tag and all three
 # installers are built, signed (Mac: Developer ID + notarization; Windows:
 # Artifact Signing when its secrets are set, else unsigned) and attached to
-# a GitHub Release. Nothing here depends on a laptop being awake.
+# a draft GitHub Release after every build succeeds.
 #
 # Secrets (repository settings, Actions):
 #   APPLE_CERT_P12_BASE64   Developer ID Application identity, PKCS#12, base64
@@ -17,21 +17,84 @@ on:
   push:
     tags: ["v*"]
 permissions:
-  contents: write
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Check release version consistency
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import ast
+          import json
+          import os
+          from pathlib import Path
+          import tomllib
+
+          versions = {
+              "pyproject.toml": tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"],
+              "desktop/package.json": json.loads(Path("desktop/package.json").read_text())["version"],
+          }
+          lock = json.loads(Path("desktop/package-lock.json").read_text())
+          versions["desktop/package-lock.json"] = lock["version"]
+          versions["desktop/package-lock.json packages root"] = lock["packages"][""]["version"]
+          source = ast.parse(Path("lse_terminal/__init__.py").read_text())
+          versions["lse_terminal/__init__.py"] = next(
+              ast.literal_eval(node.value)
+              for node in source.body
+              if isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
+          )
+          tag = os.environ["RELEASE_TAG"]
+          for path, version in versions.items():
+              if tag != f"v{version}":
+                  raise SystemExit(f"{path}: version {version} does not match release tag {tag}")
+          print(f"All package versions match {tag}")
+          PY
   mac:
-    runs-on: macos-latest
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x64
+            machine: x86_64
+          - runner: macos-15
+            arch: arm64
+            machine: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with: { path: lse-terminal }
       - uses: actions/checkout@v4
-        with: { repository: londonstrategicedge/brue, path: brue }
+        with: { repository: londonstrategicedge/brue, ref: a846522fe8af0e11ee7739ef8b6b8a4c0f7922cb, path: brue }
       - uses: actions/checkout@v4
-        with: { repository: londonstrategicedge/brue-connect, path: brue-connect }
+        with: { repository: londonstrategicedge/brue-connect, ref: 671d94bf6abbecfa7407902ec2cedd5630a8726f, path: brue-connect }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
+        with: { node-version: "22" }
+      - name: Check native build architecture
+        env:
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+        run: test "$(uname -m)" = "$EXPECTED_MACHINE"
+      - name: Build frontend
+        working-directory: lse-terminal/frontend
+        run: |
+          npm ci
+          npm run build
+      - name: Test desktop shell
+        working-directory: lse-terminal/desktop
+        run: npm test
       - name: signing identity
         env:
           P12: ${{ secrets.APPLE_CERT_P12_BASE64 }}
@@ -55,27 +118,42 @@ jobs:
           printf 'KEY_ID=%s\nISSUER_ID=%s\n' "$API_KEY_ID" "$API_ISSUER" > ~/.private_keys/notary.env
       - name: build
         run: PYTHON=python3 bash lse-terminal/desktop/build-mac.sh
+      - name: Keep architecture-specific update metadata
+        if: matrix.arch == 'x64'
+        run: mv lse-terminal/desktop/dist/latest-mac.yml lse-terminal/desktop/dist/latest-mac-x64.yml
       - uses: actions/upload-artifact@v4
         with:
-          name: mac
+          name: mac-${{ matrix.arch }}
+          if-no-files-found: error
           path: |
             lse-terminal/desktop/dist/*.dmg
             lse-terminal/desktop/dist/*.zip
             lse-terminal/desktop/dist/*.blockmap
-            lse-terminal/desktop/dist/latest-mac.yml
+            lse-terminal/desktop/dist/latest-mac*.yml
   windows:
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with: { path: lse-terminal }
       - uses: actions/checkout@v4
-        with: { repository: londonstrategicedge/brue, path: brue }
+        with: { repository: londonstrategicedge/brue, ref: a846522fe8af0e11ee7739ef8b6b8a4c0f7922cb, path: brue }
       - uses: actions/checkout@v4
-        with: { repository: londonstrategicedge/brue-connect, path: brue-connect }
+        with: { repository: londonstrategicedge/brue-connect, ref: 671d94bf6abbecfa7407902ec2cedd5630a8726f, path: brue-connect }
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
+        with: { node-version: "22" }
+      - name: Build frontend
+        working-directory: lse-terminal/frontend
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw "frontend npm ci failed" }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw "frontend build failed" }
+      - name: Test desktop shell
+        working-directory: lse-terminal/desktop
+        run: npm test
       - name: signing config
         shell: pwsh
         env:
@@ -100,7 +178,8 @@ jobs:
           & lse-terminal/desktop/build-win.ps1 -Channel public -Python python
       - uses: actions/upload-artifact@v4
         with:
-          name: windows
+          name: windows-x64
+          if-no-files-found: error
           path: |
             lse-terminal/desktop/dist/*.exe
             lse-terminal/desktop/dist/*.blockmap
@@ -108,11 +187,42 @@ jobs:
   release:
     needs: [mac, windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: Install release metadata tools
+        working-directory: desktop
+        run: npm ci --ignore-scripts
+      - name: Test release assembly
+        run: node --test desktop/prepare-release.test.js
       - uses: actions/download-artifact@v4
         with: { path: out }
+      - name: Verify all installers and update files
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          required = {
+              "mac-x64": ["*.dmg", "*.zip", "*.blockmap", "latest-mac-x64.yml"],
+              "mac-arm64": ["*.dmg", "*.zip", "*.blockmap", "latest-mac.yml"],
+              "windows-x64": ["*.exe", "*.blockmap", "latest.yml"],
+          }
+          for artifact, patterns in required.items():
+              for pattern in patterns:
+                  files = list((Path("out") / artifact).glob(pattern))
+                  if not files or any(path.stat().st_size == 0 for path in files):
+                      raise SystemExit(f"Missing or empty release asset: {artifact}/{pattern}")
+          PY
+      - name: Merge macOS update metadata and generate checksums
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node desktop/prepare-release.js out release-assets "$RELEASE_TAG"
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            out/mac/*
-            out/windows/*
+          draft: true
+          fail_on_unmatched_files: true
+          body_path: docs/releases/${{ github.ref_name }}.md
+          files: release-assets/*

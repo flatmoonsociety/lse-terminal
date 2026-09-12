@@ -90,7 +90,7 @@ echo "smoke OK"
 
 echo "== electron app (dmg + zip)"
 cd "$DESK"
-npm install
+npm ci
 # Release channel. LSE_CHANNEL=demo builds LSE DEMO TERMINAL, a separate app
 # (own name, bundle id, updater cache and config folder) that installs next
 # to the public LSE Terminal and updates from the private shelf's demo/
@@ -186,10 +186,10 @@ if security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID 
   export APPLE_API_ISSUER="$ISSUER_ID"
   if [ ! -f "$APPLE_API_KEY" ]; then echo "notary key $APPLE_API_KEY missing" >&2; exit 1; fi
   echo "   signing with Developer ID and notarizing (team T9GM7MY6B8)"
-  npx electron-builder --mac ${EB_ARGS[@]+"${EB_ARGS[@]}"}
+  npx electron-builder --mac ${EB_ARGS[@]+"${EB_ARGS[@]}"} --publish never
 else
   echo "   no Developer ID identity + notary key on this Mac: unsigned build"
-  CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder --mac ${EB_ARGS[@]+"${EB_ARGS[@]}"}
+  CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder --mac ${EB_ARGS[@]+"${EB_ARGS[@]}"} --publish never
 fi
 # Say the architecture out loud. The frozen sidecar is a native Mach-O and
 # PyInstaller cannot produce a universal one, so this dmg runs ONLY on Macs

@@ -63,7 +63,8 @@ Write-Host "smoke OK"
 
 Write-Host "== electron app (nsis)"
 Set-Location $Desk
-npm install
+npm ci
+if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
 $ebArgs = @("--win")
 if ($Channel -eq "dev") { $Channel = "demo" }
 if ($Channel -eq "demo") {
@@ -94,7 +95,7 @@ if ($Channel -eq "demo") {
 } else {
   Write-Host "   channel: public"
 }
-npx electron-builder @ebArgs
+npx electron-builder @ebArgs --publish never
 if ($LASTEXITCODE -ne 0) { throw "electron-builder failed" }
 Write-Host "done:"
 Get-ChildItem (Join-Path $Desk "dist") -Filter "*.exe" | ForEach-Object { Write-Host "  $($_.Name)  $($_.Length) bytes" }

@@ -1,6 +1,6 @@
 """LSE Terminal: a free, open-source market research terminal by London Strategic Edge."""
 
-__version__ = "0.0.13"
+__version__ = "0.0.14"
 
 
 def __getattr__(name):

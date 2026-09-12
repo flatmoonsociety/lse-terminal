@@ -1666,12 +1666,9 @@ def create_app() -> FastAPI:
     # ── auto-update check ─────────────────────────────────────────────
     # The desktop app updates itself (electron-updater in desktop/main.js
     # against the same feed); this endpoint is for pip/source runs, where
-    # the shell shows a banner instead. latest.yml is served with
-    # Cache-Control: no-store and fetched here with a cache-busting query,
-    # so a fresh release is visible on the next check; the 10 minute
-    # in-process interval only spaces out the remote hits, it never serves
-    # a stale answer past that window.
-    RELEASES_BASE = "https://terminal.londonstrategicedge.com/releases/"
+    # the shell shows a banner instead. GitHub's latest/download redirect
+    # follows this fork's published release; checks are cached for 10 minutes.
+    RELEASES_BASE = "https://github.com/flatmoonsociety/lse-terminal/releases/latest/download/"
     update_cache = {"t": 0.0, "latest": "", "path": ""}
 
     @app.get("/api/update/status")

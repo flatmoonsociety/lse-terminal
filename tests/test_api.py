@@ -1,4 +1,5 @@
 import json
+import shlex
 
 import pytest
 from fastapi.testclient import TestClient
@@ -214,10 +215,26 @@ def _brokers(client):
     return {b["broker"]: b for b in client.get("/api/broker/list").json()}
 
 
-def test_broker_list_names_each_broker_from_its_own_handshake(client):
+@pytest.fixture()
+def paper_client(tmp_path, monkeypatch):
+    from lse_terminal.engine import broker_hub
+
+    # Custom profiles belong to the user's registry, not the shipped defaults.
+    monkeypatch.setenv("BRUE_CONNECT_HOME", str(tmp_path))
+    monkeypatch.setenv("LSE_TERMINAL_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("LSE_API_KEY", raising=False)
+    monkeypatch.setattr(broker_hub, "fetch_directory", lambda _: None)
+    command = broker_hub.builtin_brokers(broker_hub.connect_base())["paper"]["cmd"]
+    (tmp_path / "brokers.json").write_text(json.dumps({"brokers": {
+        "paper-fast": {"command": shlex.join(command)},
+    }}))
+    return TestClient(create_app(), base_url="http://127.0.0.1")
+
+
+def test_broker_list_names_each_broker_from_its_own_handshake(paper_client):
     """The picker's rows come from the brokers, not from a table we ship."""
-    assert client.post("/api/broker/probe", json={"broker": "paper-fast"}).is_success
-    row = _brokers(client)["paper-fast"]
+    assert paper_client.post("/api/broker/probe", json={"broker": "paper-fast"}).is_success
+    row = _brokers(paper_client)["paper-fast"]
     # The paper adapter's handshake supplies this; nothing in the terminal
     # hardcodes the display name.
     assert row["identity"]["display_name"] == "Paper simulator"
@@ -226,9 +243,9 @@ def test_broker_list_names_each_broker_from_its_own_handshake(client):
     assert row["broker"] == "paper-fast"    # the user's own profile name
 
 
-def test_probe_does_not_open_a_session(client):
-    client.post("/api/broker/probe", json={"broker": "paper-fast"})
-    assert _brokers(client)["paper-fast"]["connected"] is False
+def test_probe_does_not_open_a_session(paper_client):
+    assert paper_client.post("/api/broker/probe", json={"broker": "paper-fast"}).is_success
+    assert _brokers(paper_client)["paper-fast"]["connected"] is False
 
 
 def test_paper_brokers_trade_without_arming(client):
