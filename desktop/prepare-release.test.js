@@ -14,7 +14,7 @@ test("release assembly merges native mac updates, checksums every asset and reje
     for (const [group, metadata] of Object.entries(groups)) {
       const folder = path.join(root, "in", group);
       fs.mkdirSync(folder, { recursive: true });
-      const names = group.startsWith("mac") ? [`app-${group}.zip`, `app-${group}.dmg`] : ["app.exe"];
+      const names = group.startsWith("mac") ? [`app ${group}.zip`, `app ${group}.dmg`] : ["app.exe"];
       const info = { version: "0.0.14", files: names.map(url => ({ url, sha512: `hash-${url}`, size: 7 })), path: names[0], sha512: "legacy" };
       for (const name of names) fs.writeFileSync(path.join(folder, name), "payload");
       fs.writeFileSync(path.join(folder, metadata), yaml.dump(info));
@@ -23,8 +23,8 @@ test("release assembly merges native mac updates, checksums every asset and reje
     const output = path.join(root, "out");
     await prepareRelease(input, output, "v0.0.14");
     const merged = yaml.load(fs.readFileSync(path.join(output, "latest-mac.yml"), "utf8"));
-    assert.deepEqual(merged.files.map(file => file.url), ["app-mac-x64.zip", "app-mac-x64.dmg", "app-mac-arm64.zip", "app-mac-arm64.dmg"]);
-    assert.equal(merged.path, "app-mac-x64.zip");
+    assert.deepEqual(merged.files.map(file => file.url), ["app.mac-x64.zip", "app.mac-x64.dmg", "app.mac-arm64.zip", "app.mac-arm64.dmg"]);
+    assert.equal(merged.path, "app.mac-x64.zip");
     const lines = fs.readFileSync(path.join(output, "SHA256SUMS.txt"), "utf8").trim().split("\n");
     assert.equal(lines.length, fs.readdirSync(output).length - 1);
     for (const line of lines) {
