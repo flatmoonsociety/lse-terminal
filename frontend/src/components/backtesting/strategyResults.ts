@@ -8,8 +8,38 @@ export type StrategyTrade = {
   exit_price: number | null;
   qty: number;
   pnl: number;
+  gross_pnl?: number | null;
+  commission?: number | null;
+  entry_commission?: number | null;
+  exit_commission?: number | null;
   pnl_pct: number;
   bars_held: number;
+  component_id?: string;
+  component_label?: string;
+  strategy?: string;
+  symbol?: string;
+  timeframe?: string;
+};
+
+export type PortfolioComponent = {
+  id: string;
+  label: string;
+  strategy: string;
+  symbol: string;
+  timeframe: string;
+  allocation_pct: number;
+  initial_capital: number;
+  final_equity: number;
+  net_profit: number;
+  gross_profit?: number | null;
+  total_commission?: number | null;
+  commission_pct?: number | null;
+  commission_per_unit?: number | null;
+  total_trades: number;
+  max_drawdown_pct: number;
+  start_ts: number;
+  end_ts: number;
+  daily_equity_curve: [number, number][];
 };
 
 export type StrategyResult = {
@@ -19,15 +49,38 @@ export type StrategyResult = {
   initial_capital: number;
   final_equity: number;
   net_profit: number;
+  gross_profit?: number | null;
+  total_commission?: number | null;
+  commission_pct?: number | null;
+  commission_per_unit?: number | null;
   stats: Record<string, any>;
   equity_curve: [number, number][];
   benchmark_curve?: [number, number][];
   trades: StrategyTrade[];
   plots?: Record<string, [number, number][]>;
+  daily_equity_curve?: [number, number][];
+  portfolio?: {
+    name: string;
+    currency: string;
+    allocation_model: 'fixed';
+    unallocated_capital: number;
+    components: PortfolioComponent[];
+    methodology: string[];
+  };
 };
 
 export const finite = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);
+
+// Calendar-time CAGR must include weekends, holidays and missing observations.
+export function calendarCagr(curve: [number, number][], initial: number, final: number): number | null {
+  if (curve.length < 2 || !finite(initial) || initial <= 0 || !finite(final) || final <= 0 ||
+      curve.some(([, value]) => value <= 0)) return null;
+  const years = (curve[curve.length - 1][0] - curve[0][0]) / (365.25 * 86400);
+  if (!finite(years) || years <= 0) return null;
+  const value = Math.expm1(Math.log(final / initial) / years) * 100;
+  return finite(value) ? value : null;
+}
 
 export function resultNumber(value: unknown, digits = 2): string {
   if (value === '__+Inf__') return '∞';
@@ -43,6 +96,19 @@ export function utcTime(seconds: number | null | undefined): string {
   return Number.isFinite(date.getTime()) ? date.toISOString().slice(0, 19).replace('T', ' ') : '—';
 }
 
+// Chart lines are sampled independently. Compare their original observations
+// at the same instant, rather than the potentially different sampled points.
+export function curveValueAt(curve: [number, number][], ts: number): number | null {
+  let low = 0, high = curve.length - 1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (curve[middle][0] === ts) return curve[middle][1];
+    if (curve[middle][0] < ts) low = middle + 1;
+    else high = middle - 1;
+  }
+  return null;
+}
+
 export function tradeCsv(trades: (StrategyTrade & { id?: number })[]): string {
   // Quoting alone does not stop spreadsheet formulas in a strategy-controlled
   // direction field. Keep literal text literal when exporting to spreadsheets.
@@ -51,10 +117,13 @@ export function tradeCsv(trades: (StrategyTrade & { id?: number })[]): string {
     if (typeof value === 'string' && /^[=+@\-\t\r]/.test(text)) text = "'" + text;
     return '"' + text.replace(/"/g, '""') + '"';
   };
+  const attributed = trades.some(t => t.component_id != null);
   return [
-    ['Trade', 'Direction', 'Entry UTC', 'Exit UTC', 'Entry price', 'Exit price', 'Quantity', 'P&L', 'P&L %', 'Bars held'],
+    ['Trade', 'Direction', 'Entry UTC', 'Exit UTC', 'Entry price', 'Exit price', 'Quantity', 'Gross P&L', 'Entry commission', 'Exit commission', 'Commission', 'Net P&L', 'Net P&L %', 'Bars held',
+      ...(attributed ? ['Component', 'Strategy', 'Symbol', 'Timeframe'] : [])],
     ...trades.map((t, index) => [t.id ?? index + 1, t.direction, utcTime(t.entry_ts), t.exit_ts == null ? '' : utcTime(t.exit_ts),
-      t.entry_price, t.exit_price ?? '', t.qty, t.pnl, t.pnl_pct, t.bars_held]),
+      t.entry_price, t.exit_price ?? '', t.qty, t.gross_pnl ?? '', t.entry_commission ?? '', t.exit_commission ?? '', t.commission ?? '', t.pnl, t.pnl_pct, t.bars_held,
+      ...(attributed ? [t.component_label || t.component_id, t.strategy, t.symbol, t.timeframe] : [])]),
   ].map(row => row.map(cell).join(',')).join('\r\n');
 }
 
@@ -75,6 +144,12 @@ export function returnPeriods(equity: [number, number][], initial: number, lengt
 
 export function strategyAnalytics(result: StrategyResult) {
   const equity = (result.equity_curve || []).filter(([ts, value]) => finite(ts) && finite(value));
+  const dailyEquity = (result.daily_equity_curve || equity).filter(([ts, value]) => finite(ts) && finite(value));
+  const benchmark = (result.benchmark_curve || []).filter(([ts, value]) => finite(ts) && finite(value));
+  const benchmarkInitial = benchmark[0]?.[1];
+  const benchmarkFinal = benchmark[benchmark.length - 1]?.[1];
+  const benchmarkReturn = finite(benchmarkInitial) && benchmarkInitial > 0 && finite(benchmarkFinal)
+    ? (benchmarkFinal / benchmarkInitial - 1) * 100 : null;
   let peak = result.initial_capital;
   let maxDrawdown = 0;
   let maxDrawdownPct = 0;
@@ -113,8 +188,11 @@ export function strategyAnalytics(result: StrategyResult) {
     return { side, count: rows.length, net, winRate: rows.length ? wins.length / rows.length * 100 : null,
       average: rows.length ? net / rows.length : null };
   });
-  return { equity, drawdown, maxDrawdown, maxDrawdownPct, longestUnderwater,
-    days: returnPeriods(equity, result.initial_capital, 10), months: returnPeriods(equity, result.initial_capital, 7),
+  return { equity, benchmark, benchmarkReturn,
+    cagr: calendarCagr(equity, result.initial_capital, result.final_equity),
+    benchmarkCagr: calendarCagr(benchmark, benchmarkInitial, benchmarkFinal),
+    drawdown, maxDrawdown, maxDrawdownPct, longestUnderwater,
+    days: returnPeriods(dailyEquity, result.initial_capital, 10), months: returnPeriods(dailyEquity, result.initial_capital, 7),
     trades, wins: wins.length, losses: losses.length, breakeven: trades.length - wins.length - losses.length,
     grossWin, grossLoss, histogram, direction,
     averageWin: wins.length ? grossWin / wins.length : null,

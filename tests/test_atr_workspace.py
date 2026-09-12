@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from fastapi.testclient import TestClient
 
-from lse_terminal.backtest.atr_phase import STARTER
+from lse_terminal.backtest.atr_phase import STARTER, Config, Kernel, MinuteBar, audit_incomplete_sessions
 from lse_terminal.backtest.starters import STARTERS
 from lse_terminal.engine.server import create_app
 from lse_terminal.backtest.runner import PythonRunner
@@ -124,3 +124,25 @@ def test_atr_integrity_halt_cannot_silently_return_partial_backtest():
     candles.loc[60, "high"] = 16999.99
     with pytest.raises(BacktestError, match="Strategy halted.*Invalid minute OHLCV"):
         PythonRunner().run(STARTER, candles, "NQ_F_1M", "1m")
+
+
+def test_atr_causal_gap_policy_skips_one_broken_bucket_only():
+    """A single missing minute must not preblock the rest of the session."""
+    clock = pd.date_range("2024-07-16 09:20", "2024-07-16 16:01",
+                          freq="min", tz="America/New_York").delete(12)  # 09:32 ET
+    bars = [MinuteBar(t.to_pydatetime(), 17000, 17001, 16999, 17000, 1)
+            for t in clock]
+    causal_config = Config(instrument="NQ", session_gap_policy="causal")
+    blocked = audit_incomplete_sessions((bar.open_time for bar in bars), causal_config)
+    assert blocked
+    causal = Kernel(causal_config, incomplete_session_dates=blocked)
+    for bar in bars:
+        causal.on_minute(bar)
+    assert not causal.fail_closed
+    assert causal.stats["causal_missing_required_minutes"] == 1
+
+    strict = Kernel(Config(instrument="NQ", session_gap_policy="strict"),
+                    incomplete_session_dates=blocked)
+    for bar in bars:
+        strict.on_minute(bar)
+    assert strict.session_blocked

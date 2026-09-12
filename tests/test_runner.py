@@ -5,6 +5,7 @@ match. Everything else (sizing, commission, equity, stats) is ours and must
 stay correct without them thinking about it.
 """
 
+import json
 import math
 
 import numpy as np
@@ -293,6 +294,55 @@ def test_extended_stats_present_when_asked(runner):
         assert key in ext
 
 
+def test_annualized_return_uses_calendar_time_despite_market_gaps():
+    start = int(pd.Timestamp("2016-05-29 22:01:00Z").timestamp())
+    end = int(pd.Timestamp("2026-09-11 19:59:00Z").timestamp())
+    capital, final = 100_000.0, 366_215.0
+    # Extra minute bars (or missing sessions) must not shorten a ten-year run.
+    sparse = [[start, capital], [start + 60, 110_000.0], [end, final]]
+    dense = [[int(ts), float(eq)] for ts, eq in zip(
+        np.linspace(start, end, 1001), np.linspace(capital, final, 1001))]
+    years = (end - start) / (365.25 * 86400.0)
+    expected = ((final / capital) ** (1 / years) - 1) * 100
+    for curve in (sparse, dense):
+        stats = PythonRunner._stats([], curve, capital, final, 0, True)
+        assert stats["extended"]["annualizedReturn"] == pytest.approx(expected)
+
+
+def test_annualized_risk_uses_observed_intervals_per_calendar_year():
+    eq = np.array([100.0, 110.0, 99.0, 105.0, 90.0])
+    # Four return observations over one calendar year, with a weekend and
+    # a large market-data gap. Median minute spacing would inflate the ratios.
+    ts = [0, 60, 3 * 86400 + 60, 3 * 86400 + 120, 365.25 * 86400]
+    stats = PythonRunner._stats([], list(map(list, zip(ts, eq))), 100, 90, 0, True)
+    rets = np.diff(eq) / eq[:-1]
+    scale = math.sqrt(len(rets))
+    assert stats["sharpeRatio"] == pytest.approx(
+        rets.mean() / rets.std(ddof=1) * scale)
+    assert stats["extended"]["annualizedVol"] == pytest.approx(
+        rets.std(ddof=1) * scale * 100)
+    assert stats["extended"]["sortino"] == pytest.approx(
+        rets.mean() / rets[rets < 0].std(ddof=1) * scale)
+
+
+@pytest.mark.parametrize("curve,capital,final", [
+    ([], 100, 100),
+    ([[0, 100]], 100, 100),
+    ([[0, 100], [0, 110]], 100, 110),
+    ([[0, 0], [31557600, 100]], 0, 100),
+    ([[0, -100], [31557600, 100]], -100, 100),
+    ([[0, 100], [31557600, 0]], 100, 0),
+    ([[0, 100], [31557600, -10]], 100, -10),
+    ([[0, 100], [60, 0], [31557600, 110]], 100, 110),
+    ([[0, 100], [1, 200]], 100, 200),  # Unrepresentably large one-second CAGR.
+])
+def test_undefined_cagr_is_unavailable_and_json_safe(curve, capital, final):
+    stats = PythonRunner._stats([], curve, capital, final, 0, True)
+    assert stats["extended"]["annualizedReturn"] is None
+    assert stats["extended"]["calmar"] is None
+    json.dumps(stats, allow_nan=False)
+
+
 # ── research modes ───────────────────────────────────────────────────────
 
 def test_montecarlo_is_deterministic_per_seed(runner):
@@ -324,6 +374,39 @@ def test_walkforward_sweeps_params_and_scores_folds(runner):
 def test_walkforward_needs_params(runner):
     with pytest.raises(BacktestError, match="at least one param grid"):
         runner.walkforward("trades = []", candles(), params={})
+
+
+def test_walkforward_exposes_training_candidates_without_selecting_on_test_profit(runner):
+    df = candles(n=20)
+    prices = np.r_[np.arange(100., 110.), np.arange(120., 110., -1)]
+    for column in ("open", "close"):
+        df[column] = prices
+    df["high"], df["low"] = prices + 1, prices - 1
+    script = '''side = int(params['side'])
+if not side:
+    raise ValueError('unsupported neutral candidate')
+trades = [{'entry_i': 0, 'exit_i': len(df) - 1,
+           'dir': 'long' if side > 0 else 'short', 'qty': params['qty']}]
+'''
+    result = runner.walkforward(script, df, params={"side": "-1,0,1"},
+                                folds=1, train=0.5, metric="profitFactor",
+                                options={"params": {"qty": 2}})
+    fold = result["folds"][0]
+    assert [fold[key] for key in ("trainStartTs", "trainEndTs", "testStartTs", "testEndTs")] == [
+        int(df.ts.iloc[i]) for i in (0, 9, 10, 19)]
+    losing, failed, winning = fold["candidates"]
+    assert losing == {"params": {"side": -1.0}, "metricValue": 0.0,
+                      "netProfit": -18.0, "trades": 1}
+    assert failed["params"] == {"side": 0.0}
+    assert failed["metricValue"] is failed["netProfit"] is failed["trades"] is None
+    assert "unsupported neutral candidate" in failed["error"]
+    assert winning == {"params": {"side": 1.0}, "metricValue": "__+Inf__",
+                       "netProfit": 18.0, "trades": 1}
+    # Long won training; the falling test must not retroactively select short.
+    assert fold["bestParams"] == {"side": 1.0}
+    assert fold["oosNetProfit"] == -18.0
+    assert result["totalOosTrades"] == 1
+    json.dumps(result, allow_nan=False)
 
 
 # ── the deadline ─────────────────────────────────────────────────────────

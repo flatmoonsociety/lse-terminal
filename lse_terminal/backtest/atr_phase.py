@@ -96,6 +96,10 @@ class Config:
     point_value: float | None = None
     start_trading_date: int = 20200203
     reset_gap_threshold_ticks: int = 400
+    # strict reproduces the supplied NinjaTrader source. causal keeps bars
+    # already observed, drops only a broken ten-minute bucket, and resumes at
+    # the next aligned bucket without fabricating OHLCV.
+    session_gap_policy: str = "strict"
     custom_entry_start_time: int = 930
     custom_entry_end_time: int = 1100
     custom_vwap_start_time: int = 930
@@ -109,6 +113,8 @@ class Config:
         if not instrument:
             raise ValueError("Instrument master name is required")
         object.__setattr__(self, "instrument", instrument)
+        if self.session_gap_policy not in ("strict", "causal"):
+            raise ValueError("session_gap_policy must be 'strict' or 'causal'")
         profile = self.session_profile
         if profile == "Automatic":
             if instrument in ("ES", "MES", "NQ", "MNQ"):
@@ -261,6 +267,8 @@ class Kernel:
         self.stats: Counter = Counter()
         self.current_session_date: date | None = None
         self.session_blocked = False
+        self.causal_gaps = config.session_gap_policy == "causal"
+        self._causal_session_counted = False
         self.required_minute_count = 0
         self.cash_close_exit_requested = False
         self.fail_closed = False
@@ -341,18 +349,31 @@ class Kernel:
         if self.current_session_date != day:
             if (self.current_session_date is not None and not self.session_blocked
                     and self.required_minute_count != self.session.required_count):
-                return self._block(bar, position, "Prior session ended without all required cash-window minutes")
+                if not self.causal_gaps:
+                    return self._block(bar, position, "Prior session ended without all required cash-window minutes")
+                if not self._causal_session_counted:
+                    self.stats["causal_incomplete_sessions"] += 1
+                    self._causal_session_counted = True
             if self._bucket:
                 self.stats["omitted_incomplete_buckets"] += 1
                 self._bucket.clear()
             self.current_session_date = day
             if position or self.shadow_position or unresolved_order:
+                if self.causal_gaps and not unresolved_order:
+                    # A sparse/early-close session may not have produced the
+                    # normal 16:00 bucket. Exit any carried exposure at the
+                    # first next-session bar rather than halting the whole
+                    # history; strict mode retains source parity.
+                    self.shadow_position = 0
+                    self.stats["causal_boundary_exits"] += position != 0
+                    return self._admin(bar, position, "CausalSessionBoundaryExit")
                 self.halt("Exposure, shadow, or unresolved order crossed the electronic-session boundary")
                 return self._admin(bar, position, "UnexpectedSessionCarry")
             self.required_minute_count = 0
             self.cash_close_exit_requested = False
+            self._causal_session_counted = False
             frozen = day in self.frozen_dates
-            preflight = day in self.incomplete_session_dates
+            preflight = day in self.incomplete_session_dates and not self.causal_gaps
             schedule = day in self.schedule_blocked_dates
             self.session_blocked = frozen or preflight or schedule
             if self.session_blocked:
@@ -365,10 +386,20 @@ class Kernel:
         minute = _minute(eastern)
         if eastern.date() == day:
             if minute >= self.session.cash_close and self.required_minute_count != self.session.required_count:
-                return self._block(bar, position, "Cash window ended without all required minutes")
+                if not self.causal_gaps:
+                    return self._block(bar, position, "Cash window ended without all required minutes")
+                if not self._causal_session_counted:
+                    self.stats["causal_incomplete_sessions"] += 1
+                    self._causal_session_counted = True
+                if position or unresolved_order:
+                    self.cash_close_exit_requested = True
+                    return self._admin(bar, position, "ConfiguredCashClose")
             if self.session.required_start <= minute < self.session.cash_close:
                 if minute != self.session.required_start + self.required_minute_count:
-                    return self._block(bar, position, "Missing or duplicated required cash-window minute")
+                    if not self.causal_gaps:
+                        return self._block(bar, position, "Missing or duplicated required cash-window minute")
+                    self.stats["causal_missing_required_minutes"] += 1
+                    self.required_minute_count = minute - self.session.required_start
                 self.required_minute_count += 1
         previous = self._previous_eligible
         reset = (
@@ -547,14 +578,19 @@ raw_symbol = str(globals().get('symbol') or '').upper().split(':')[-1]
 _master = re.match(r'(MNQ|NQ|MES|ES|MGC|GC)', raw_symbol.replace('_', ''))
 _symbol_instrument = _master.group(1) if _master else ''
 # An explicit instrument override controls contract economics.
-_instrument = str(params.get('instrument') or _symbol_instrument or 'MNQ').upper()
-if _instrument not in ('ES','MES','NQ','MNQ','GC','MGC'):
-    raise ValueError(f'Unsupported futures instrument {raw_symbol!r}; set params.instrument')
+_instrument = str(params.get('instrument') or _symbol_instrument or raw_symbol or 'MNQ').upper()
+_profile = str(params.get('session_profile', 'Automatic'))
+if _instrument not in ('ES','MES','NQ','MNQ','GC','MGC') and _profile != 'Custom':
+    raise ValueError(f'Unsupported instrument {raw_symbol!r}; set params.instrument and session_profile="Custom"')
 config = Config(
     instrument=_instrument,
+    session_profile=_profile,
+    tick_size=float(params['tick_size']) if 'tick_size' in params else None,
+    point_value=float(params['point_value']) if 'point_value' in params else None,
     start_trading_date=int(params.get('start_trading_date') or
                            datetime.fromtimestamp(int(df.ts.iloc[0]), timezone.utc).strftime('%Y%m%d')),
     reset_gap_threshold_ticks=int(params.get('reset_gap_threshold_ticks', 400)),
+    session_gap_policy=str(params.get('session_gap_policy', 'causal')).lower(),
 )
 required = ('ts', 'open', 'high', 'low', 'close', 'volume')
 missing = [name for name in required if name not in df]

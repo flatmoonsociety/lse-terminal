@@ -198,6 +198,38 @@ def test_walkforward_requires_params(client):
     assert r.status_code == 400
 
 
+@pytest.mark.parametrize("mode", ["montecarlo", "walkforward"])
+@pytest.mark.parametrize("instrument,point_value", [("NQ", 20), ("MNQ", 2)])
+def test_research_preserves_futures_context_and_fixed_params(client, mode, instrument, point_value):
+    symbol = f"{instrument}_F_1M"
+    imported = client.post("/api/data/import", json={
+        "symbol": symbol, "csv_text": rising_csv(200, step=60),
+    })
+    assert imported.status_code == 200, imported.text
+    script = f'''from lse_terminal.backtest.atr_phase import Config
+assert symbol == {symbol!r} and timeframe == '1m'
+assert params['fixed_setting'] == 7
+config = Config(instrument=symbol.split('_')[0])
+trades = [{{'entry_i': 0, 'exit_i': len(df) - 1,
+           'qty': params.get('qty', 1), 'point_value': config.point_value}}]
+'''
+    body = {"engine": "python", "provider": "userdata", "symbol": symbol,
+            "timeframe": "1m", "script": script,
+            "options": {"params": {"fixed_setting": 7, "qty": 9}}}
+    if mode == "walkforward":
+        body.update(params={"qty": "1,2"}, folds=2, train=0.7)
+    else:
+        body.update(runs=2, seed=7)
+    response = client.post(f"/api/backtest/{mode}", json=body)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    if mode == "montecarlo":
+        assert result["baseNetProfit"] == pytest.approx(199 * 9 * point_value)
+    else:
+        assert all(fold["bestParams"]["qty"] == 2 for fold in result["folds"])
+        assert result["totalOosNetProfit"] == pytest.approx(2 * 29 * 2 * point_value)
+
+
 # ── hosted mode lockdown ─────────────────────────────────────────────────
 
 def test_hosted_mode_blocks_writes(tmp_path, monkeypatch):

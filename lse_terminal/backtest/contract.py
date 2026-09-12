@@ -76,6 +76,11 @@ class Trade:
     # Monetary value of one price point per contract.  Spot-style strategies
     # keep the backwards-compatible default of 1.0; futures set e.g. MNQ=2.
     point_value: float = 1.0
+    # None means an older/external engine did not supply fee accounting.
+    entry_commission: float | None = None
+    exit_commission: float | None = None
+    commission: float | None = None
+    gross_pnl: float | None = None
 
 
 @dataclass
@@ -96,6 +101,10 @@ class BacktestResult:
     # Series the strategy declared via `plots`: {name: [[ts, value], ...]},
     # already validated and chart-ready (runner._collect_plots).
     plots: dict = field(default_factory=dict)
+    total_commission: float | None = None
+    gross_profit: float | None = None  # Sum of all trade P&L before commission, including losses.
+    commission_pct: float | None = None
+    commission_per_unit: float | None = None
 
     def to_json(self) -> dict:
         return {
@@ -103,6 +112,8 @@ class BacktestResult:
             "timeframe": self.timeframe,
             "initial_capital": self.initial_capital,
             "final_equity": self.final_equity, "net_profit": self.net_profit,
+            "total_commission": self.total_commission, "gross_profit": self.gross_profit,
+            "commission_pct": self.commission_pct, "commission_per_unit": self.commission_per_unit,
             "stats": self.stats,
             "equity_curve": self.equity_curve,
             "benchmark_curve": self.benchmark_curve,
@@ -112,6 +123,8 @@ class BacktestResult:
                  "direction": t.direction, "entry_price": t.entry_price,
                  "exit_price": t.exit_price, "qty": t.qty, "pnl": t.pnl,
                  "pnl_pct": t.pnl_pct, "bars_held": t.bars_held,
+                 "entry_commission": t.entry_commission, "exit_commission": t.exit_commission,
+                 "commission": t.commission, "gross_pnl": t.gross_pnl,
                  **({"point_value": t.point_value}
                     if t.point_value != 1.0 else {})}
                 for t in self.trades

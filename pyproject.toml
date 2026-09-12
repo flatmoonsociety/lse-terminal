@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lse-terminal"
-version = "0.0.14"
+version = "0.0.15"
 description = "A free market terminal that runs on your own computer: live charts, an options board, a screener, an economic calendar, a strategy IDE with one click backtests, machine learning on your own data, a research wire, and an AI assistant."
 readme = "README.md"
 license = "MIT"

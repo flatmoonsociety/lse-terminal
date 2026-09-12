@@ -9,6 +9,7 @@ import asyncio
 import json
 import math
 import os
+import sqlite3
 import sys
 import types
 import time
@@ -18,7 +19,7 @@ import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from lse_terminal import __version__
 from lse_terminal.contracts import NotSupported, all_specs, compute
@@ -27,6 +28,7 @@ from lse_terminal.engine.registry import Registry, load_builtins, load_plugins
 from lse_terminal.engine.user_indicators import TEMPLATE, UserIndicators
 from lse_terminal.engine import notebooks as nbstore
 from lse_terminal.engine import workspace
+from lse_terminal.engine import saved_backtests
 
 _STATIC = Path(__file__).resolve().parent.parent / "ui" / "static"
 
@@ -233,6 +235,35 @@ class BacktestIn(BaseModel):
 class MonteCarloIn(BacktestIn):
     runs: int = 1000
     seed: int = 42
+
+
+class SavedBacktestIn(BaseModel):
+    name: str
+    result: dict
+    context: dict = {}
+
+
+class PortfolioComponentIn(BaseModel):
+    id: str
+    label: str
+    strategy: str
+    script: str
+    symbol: str
+    timeframe: str
+    allocation_pct: float
+    params: dict = {}
+    commission_pct: float = 0.0
+    commission_per_unit: float = 0.0
+    currency: str = "USD"
+
+
+class PortfolioBacktestIn(BaseModel):
+    name: str
+    capital: float
+    currency: str = "USD"
+    from_: str | None = Field(default=None, alias="from")
+    to: str | None = None
+    components: list[PortfolioComponentIn]
 
 
 class WalkForwardIn(BacktestIn):
@@ -947,6 +978,45 @@ def create_app() -> FastAPI:
         except ValueError as e:
             raise HTTPException(404, str(e))
 
+    @app.get("/api/backtest/saved")
+    def saved_backtests_list():
+        deny_hosted()
+        try:
+            return saved_backtests.listing()
+        except (OSError, sqlite3.Error, ValueError) as e:
+            raise HTTPException(500, f"could not read saved backtests: {e}")
+
+    @app.post("/api/backtest/saved")
+    def saved_backtests_create(body: SavedBacktestIn):
+        deny_hosted()
+        try:
+            return saved_backtests.create(body.name, body.result, body.context)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(400, str(e))
+        except (OSError, sqlite3.Error) as e:
+            raise HTTPException(507, f"could not save backtest: {e}")
+
+    @app.get("/api/backtest/saved/{report_id}")
+    def saved_backtests_read(report_id: str):
+        deny_hosted()
+        try:
+            return saved_backtests.read(report_id)
+        except KeyError:
+            raise HTTPException(404, "saved backtest not found")
+        except (OSError, sqlite3.Error, ValueError, EOFError) as e:
+            raise HTTPException(500, f"saved backtest is unreadable: {e}")
+
+    @app.delete("/api/backtest/saved/{report_id}")
+    def saved_backtests_delete(report_id: str):
+        deny_hosted()
+        try:
+            saved_backtests.delete(report_id)
+        except KeyError:
+            raise HTTPException(404, "saved backtest not found")
+        except (OSError, sqlite3.Error) as e:
+            raise HTTPException(507, f"could not delete backtest: {e}")
+        return {"ok": True}
+
     def _resolve_datasets(names: list[str]) -> dict:
         """Attached user datasets -> {use_name: engine-ready file path}."""
         from lse_terminal.providers import userdata
@@ -1032,6 +1102,27 @@ def create_app() -> FastAPI:
             raise HTTPException(400, str(e))
         return result.to_json()
 
+    @app.post("/api/backtest/portfolio")
+    def backtest_portfolio(body: PortfolioBacktestIn):
+        deny_hosted()
+        from lse_terminal.backtest.contract import BacktestError
+        from lse_terminal.backtest.portfolio import run_portfolio
+        from lse_terminal.providers.userdata import load_manifest
+        try:
+            manifest = load_manifest()
+            for component in body.components:
+                entry = manifest.get(component.symbol)
+                if entry and (entry.get("kind", "ohlcv") != "ohlcv"
+                              or component.timeframe != entry.get("timeframe", "?")):
+                    raise BacktestError(f"Component {component.label!r} ({component.symbol}): "
+                                        "select its imported OHLCV timeframe; portfolio runs do not resample data")
+            return run_portfolio(name=body.name, capital=body.capital, currency=body.currency,
+                                 components=[component.model_dump() for component in body.components],
+                                 provider=reg.get("userdata"), start=body.from_, end=body.to,
+                                 data_files=_resolve_datasets([]))
+        except BacktestError as exc:
+            raise HTTPException(400, str(exc))
+
     def _quant_mode(body, method: str, **kwargs):
         """Shared plumbing for the engine's quant modes (MC, walk-forward)."""
         from lse_terminal.backtest.contract import BacktestError
@@ -1053,7 +1144,8 @@ def create_app() -> FastAPI:
             raise HTTPException(502, f"candles failed: {e}")
         try:
             return fn(body.script, candles, options=body.options,
-                      data_files=_resolve_datasets(body.datasets), **kwargs)
+                      data_files=_resolve_datasets(body.datasets),
+                      symbol=body.symbol, timeframe=body.timeframe, **kwargs)
         except BacktestError as e:
             raise HTTPException(400, str(e))
 

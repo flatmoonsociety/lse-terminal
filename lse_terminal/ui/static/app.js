@@ -38,6 +38,7 @@ const state = {
   // the hosted relay speak the LSE symbol space, so the LSE map is the
   // right fallback there. null = not fetched yet.
   logoFallback: null,
+  savedBacktests: [],             // durable completed strategy reports
 };
 
 /* Hosted-vs-local base path: the same bundle serves the local app (at "/")
@@ -225,6 +226,10 @@ function activeGridSymbol() {
 }
 
 function updateWindowTitle() {
+  if ($("portfolio-backtest") && !$("portfolio-backtest").classList.contains("hidden")) {
+    document.title = "Portfolio Backtest · LSE Terminal";
+    return;
+  }
   // The native title bar mirrors the open chart:
   // pair + timeframe instead of the bare app name. Electron forwards
   // document.title to the OS title bar; browser tabs get it for free.
@@ -2628,9 +2633,38 @@ const backtest = { engine: "python", equityChart: null, equitySeries: null };
    continue to deal only with files and dataset previews. */
 const backtestReports = new Map();
 let backtestReportSeq = 0;
+const portfolioBacktest = { reportActive: null, mounted: false };
+
+function backtestReportSession(editor) {
+  return editor === "portfolio" ? portfolioBacktest : editor === "wsx" ? wsx : py;
+}
+
+function refreshBacktestReportTabs(editor) {
+  if (editor === "portfolio") renderPortfolioTabs();
+  else if (editor === "wsx") wsxRenderTabs();
+  else renderPyTabs();
+}
+
+function renderPortfolioTabs() {
+  const host = $("portfolio-tabs");
+  host.innerHTML = "";
+  const setup = document.createElement("button");
+  setup.id = "portfolio-builder-tab";
+  setup.className = "py-tab" + (portfolioBacktest.reportActive ? "" : " active");
+  setup.textContent = "Portfolio setup";
+  setup.setAttribute("aria-pressed", String(!portfolioBacktest.reportActive));
+  setup.onclick = () => {
+    window.LSEBacktestResults.unmount($("portfolio-report"));
+    hideBacktestReport("portfolio");
+    renderPortfolioTabs();
+    $("portfolio-builder-tab").focus();
+  };
+  host.appendChild(setup);
+  renderBacktestReportTabs("portfolio");
+}
 
 function hideBacktestReport(editor) {
-  const session = editor === "wsx" ? wsx : py;
+  const session = backtestReportSession(editor);
   session.reportActive = null;
   $(editor + "-main").classList.remove("report-active");
   $(editor + "-report").classList.add("hidden");
@@ -2640,7 +2674,7 @@ function activateBacktestReport(id) {
   const report = backtestReports.get(id);
   if (!report) return;
   const { editor } = report;
-  const session = editor === "wsx" ? wsx : py;
+  const session = backtestReportSession(editor);
   session.reportActive = id;
   $(editor + "-main").classList.add("report-active");
   const host = $(editor + "-report");
@@ -2649,9 +2683,12 @@ function activateBacktestReport(id) {
   window.LSEBacktestResults.unmount(host);
   window.LSEBacktestResults.mount(host, {
     result: report.result, strategy: report.strategy, elapsedMs: report.elapsedMs,
+    researchRequest: report.request, analysis: report.analysis,
+    saved: !!report.savedId,
+    onSave: (analysis, name) => saveBacktestReport(id, analysis, name),
     onClose: () => closeBacktestReport(id),
   });
-  if (editor === "wsx") wsxRenderTabs(); else renderPyTabs();
+  refreshBacktestReportTabs(editor);
   requestAnimationFrame(() => {
     const tab = $(editor + "-tabs").querySelector(`[data-report-id="${id}"]`);
     tab?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -2664,38 +2701,42 @@ function closeBacktestReport(id) {
   if (!report) return;
   backtestReports.delete(id);
   const { editor } = report;
-  const session = editor === "wsx" ? wsx : py;
+  const session = backtestReportSession(editor);
   if (session.reportActive === id) {
     window.LSEBacktestResults.unmount($(editor + "-report"));
     hideBacktestReport(editor);
     if (editor === "py" && py.active) pyActivateTab(py.active);
     if (editor === "wsx" && wsx.open) wsxOpen(wsx.open);
-    $(editor + "-code").focus();
+    if (editor !== "portfolio") $(editor + "-code").focus();
   }
-  if (editor === "wsx") wsxRenderTabs(); else renderPyTabs();
+  refreshBacktestReportTabs(editor);
+  if (editor === "portfolio" && !session.reportActive) $("portfolio-builder-tab").focus();
 }
 
 function renderBacktestReportTabs(editor) {
-  const session = editor === "wsx" ? wsx : py;
+  const session = backtestReportSession(editor);
+  const prefix = editor === "portfolio" ? "py" : editor;
   const host = $(editor + "-tabs");
   for (const [id, report] of backtestReports) {
     if (report.editor !== editor) continue;
     const tab = document.createElement("div");
-    tab.className = editor + "-tab report-tab" + (session.reportActive === id ? " active" : "");
+    tab.className = prefix + "-tab report-tab" + (session.reportActive === id ? " active" : "");
     tab.dataset.reportId = id;
     const label = `Backtest ${report.number} · ${(report.strategy || report.result.symbol || "Report").split("/").pop()}`;
     tab.title = label;
-    tab.innerHTML = `<button class="${editor}-tab-name report-tab-open" aria-pressed="${session.reportActive === id}">${mlEsc(label)}</button>` +
-      `<button class="${editor}-tab-x" title="Close report" aria-label="Close ${mlEsc(label)}">&#10005;</button>`;
+    tab.innerHTML = `<button class="${prefix}-tab-name report-tab-open" aria-pressed="${session.reportActive === id}">${mlEsc(label)}</button>` +
+      `<button class="${prefix}-tab-x" title="Close report" aria-label="Close ${mlEsc(label)}">&#10005;</button>`;
     tab.onclick = () => activateBacktestReport(id);
-    tab.querySelector(`.${editor}-tab-x`).onclick = (e) => { e.stopPropagation(); closeBacktestReport(id); };
+    tab.querySelector(`.${prefix}-tab-x`).onclick = (e) => { e.stopPropagation(); closeBacktestReport(id); };
     host.appendChild(tab);
   }
 }
 
 async function openBacktestReport(result, context = {}) {
   if (!result || !window.LSEBacktestResults) return;
-  const editor = context.editor === "wsx" ? "wsx" : "py";
+  const editor = context.editor === "portfolio" || result.portfolio ? "portfolio"
+    : context.editor === "wsx" ? "wsx" : "py";
+  if (editor === "portfolio" && $("portfolio-backtest").classList.contains("hidden")) await openBacktest("portfolio");
   if (editor === "py" && $("pyide").classList.contains("hidden")) await openBacktest("py");
   if (editor === "wsx" && $("wsx").classList.contains("hidden")) $("rail-workspace").click();
   const number = ++backtestReportSeq, id = `report-${number}`;
@@ -2703,7 +2744,77 @@ async function openBacktestReport(result, context = {}) {
   activateBacktestReport(id);
 }
 
+async function saveBacktestReport(id, analysis, name) {
+  const report = backtestReports.get(id);
+  if (!report) throw new Error("This report is no longer open. Reopen it before saving.");
+  if (report.savedId) return;
+  if (report.saving) throw new Error("This report is already being saved. Please wait.");
+  if (typeof name !== "string" || !name.trim() || name.trim().length > 200) {
+    throw new Error("Use a backtest name between 1 and 200 characters.");
+  }
+  report.saving = true;
+  try {
+    const response = await fetch("/api/backtest/saved", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name.trim(), result: report.result,
+        context: { strategy: report.strategy, elapsedMs: report.elapsedMs,
+          analysis: analysis || report.analysis || null,
+          request: report.request || null, portfolioRequest: report.portfolioRequest || null,
+          editor: report.editor } }),
+    });
+    const row = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(typeof row?.detail === "string" ? row.detail : `Save failed (HTTP ${response.status}).`);
+    if (!row?.id) throw new Error("The server did not confirm that the report was saved.");
+    report.savedId = row.id;
+    report.savedName = row.name;
+    report.analysis = analysis || report.analysis;
+  } finally {
+    report.saving = false;
+  }
+  // A slow save must not take the user back to a report they have since left.
+  if (backtestReportSession(report.editor).reportActive === id) activateBacktestReport(id);
+  try {
+    await refreshLibraryAll();
+    status(`saved backtest · ${report.savedName}`);
+  } catch (error) {
+    status(`backtest saved; could not refresh the library: ${error.message || error}`);
+  }
+}
+
+async function openSavedBacktest(id) {
+  try {
+    const response = await fetch(`/api/backtest/saved/${encodeURIComponent(id)}`);
+    if (!response.ok) throw new Error((await response.json()).detail || response.statusText);
+    const saved = await response.json();
+    const context = saved.context || {};
+    await openBacktestReport(saved.result, {
+      editor: context.portfolioRequest || saved.result?.portfolio ? "portfolio" : "py",
+      strategy: context.strategy || saved.name,
+      elapsedMs: context.elapsedMs, savedId: saved.id, savedName: saved.name,
+      request: context.request || undefined, analysis: context.analysis || undefined,
+      portfolioRequest: context.portfolioRequest || undefined,
+    });
+    status(`opened saved backtest · ${saved.name}`);
+  } catch (error) {
+    status(`could not open backtest: ${error.message || error}`);
+  }
+}
+
+async function deleteSavedBacktest(id) {
+  const row = (state.savedBacktests || []).find((item) => item.id === id);
+  if (!row || !window.confirm(`Delete saved backtest “${row.name}”?`)) return;
+  try {
+    const response = await fetch(`/api/backtest/saved/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error((await response.json()).detail || response.statusText);
+    await refreshLibraryAll();
+    status("saved backtest deleted");
+  } catch (error) {
+    status(`could not delete backtest: ${error.message || error}`);
+  }
+}
+
 function setupBacktest() {
+  setupBacktestFees();
   $("bt-open").onclick = async () => {
     $("backtest").classList.remove("hidden");
     if (!$("bt-src").value) {
@@ -6013,10 +6124,38 @@ function setupAiPanel(hosted) {
   open(); // permanent rail: live from boot on every tab
 }
 
+function setupBacktestFees() {
+  for (const prefix of ["bt", "py", "wsx"]) {
+    const host = $(prefix + "-fees");
+    host.innerHTML = `<label>Commission basis <select id="${prefix}-fee-mode">` +
+      `<option value="per_unit">Per contract / unit</option><option value="percent">Percentage of notional</option></select></label>` +
+      `<label><span id="${prefix}-fee-label"></span><input id="${prefix}-fee-value" type="number" min="0" step="any" value="2.5" required></label>` +
+      `<p id="${prefix}-fee-note"></p>`;
+    const update = () => {
+      const perUnit = $(prefix + "-fee-mode").value === "per_unit";
+      $(prefix + "-fee-label").textContent = perUnit ? "Amount per side (P&L currency)" : "Commission (% per side)";
+      $(prefix + "-fee-note").textContent = perUnit
+        ? "Charged per actual contract, share or unit on entry and exit. A one-unit round trip costs twice this amount in the instrument's P&L currency. Enter 0 for no commission."
+        : "Charged on entry and exit as a percentage of absolute notional (price × quantity × point value). Enter 0 for no commission.";
+    };
+    $(prefix + "-fee-mode").onchange = () => { $(prefix + "-fee-value").value = ""; update(); };
+    update();
+  }
+}
+
+function backtestCommissionOptions(prefix) {
+  const mode = $(prefix + "-fee-mode").value;
+  const raw = $(prefix + "-fee-value").value, amount = Number(raw);
+  if (!["per_unit", "percent"].includes(mode) || !raw.trim() || !Number.isFinite(amount) || amount < 0) {
+    throw new Error("Commission must be a nonnegative amount per side with a valid fee basis.");
+  }
+  return { commission_pct: mode === "percent" ? amount : 0, commission_per_unit: mode === "per_unit" ? amount : 0 };
+}
+
 /* Run options shared by every mode. Dates are UTC (the engine treats
    YYYY-MM-DD as UTC midnight, so the value passes through untouched). */
 function backtestOptions(mode) {
-  const opts = {};
+  const opts = backtestCommissionOptions("bt");
   if ($("bt-from").value) opts.from = $("bt-from").value;
   if ($("bt-to").value) opts.to = $("bt-to").value;
   if (mode === "run" && $("bt-ext").checked) opts.extended_stats = true;
@@ -6053,6 +6192,14 @@ async function runBacktest() {
   const mode = $("bt-mode").value;
   status(mode === "run" ? "running backtest…" : `running ${mode}…`);
   $("bt-err").classList.add("hidden");
+  let options;
+  try { options = backtestOptions(mode); }
+  catch (error) {
+    $("bt-err").textContent = error.message;
+    $("bt-err").classList.remove("hidden");
+    status("check backtest commission");
+    return;
+  }
   // A `# run:` pin names a MY DATA dataset, so it only applies on the
   // userdata provider; on live providers the chart symbol stays in charge.
   const pin = dataProvider() === "userdata" ? pyRunPin($("bt-src").value) : null;
@@ -6061,7 +6208,7 @@ async function runBacktest() {
     symbol: (pin && pin.symbol) || state.symbol,
     // limit 0: every bar of a local dataset; the engine caps remote data.
     timeframe: state.timeframe, script: $("bt-src").value, limit: 0,
-    options: backtestOptions(mode), datasets: attachedDatasets(),
+    options, datasets: attachedDatasets(),
   };
   let url = "/api/backtest";
   if (mode === "montecarlo") {
@@ -6075,7 +6222,7 @@ async function runBacktest() {
     body.train = parseFloat($("bt-wf-train").value) || 0.7;
     if (!Object.keys(body.params).length) {
       $("bt-err").textContent =
-        'Walk-forward needs a param grid, e.g. "len=5:30:5" with {{len}} in the script.';
+        'Walk-forward needs a param grid, e.g. "length=5:30:5" with params.get("length", 10) in the script.';
       $("bt-err").classList.remove("hidden");
       status("walk-forward needs params");
       return;
@@ -6096,7 +6243,7 @@ async function runBacktest() {
   const data = await res.json();
   if (mode === "montecarlo") renderMonteCarlo(data);
   else if (mode === "walkforward") renderWalkforward(data);
-  else renderBacktest(data);
+  else renderBacktest(data, { request: body });
 }
 
 const fmtNum = (n, d = 2) => (n == null || !isFinite(n)) ? "–" : Number(n).toFixed(d);
@@ -6151,12 +6298,14 @@ function renderWalkforward(wf) {
   status(`walk-forward · ${wf.folds.length} folds · OOS ${fmtMoney(wf.totalOosNetProfit)}`);
 }
 
-function renderBacktest(r) {
+function renderBacktest(r, context = {}) {
   $("bt-quant").classList.add("hidden");
   const ret = r.initial_capital ? (r.net_profit / r.initial_capital) * 100 : 0;
   const s = r.stats || {};
   const pos = (n) => (n >= 0 ? "pos" : "neg");
   let tiles =
+    statTile("Gross P&L", Number.isFinite(r.gross_profit) ? fmtMoney(r.gross_profit) : "Unavailable") +
+    statTile("Commission", Number.isFinite(r.total_commission) ? fmtMoney(r.total_commission) : "Unavailable") +
     statTile("Net profit", fmtMoney(r.net_profit), pos(r.net_profit)) +
     statTile("Return", ret.toFixed(2) + "%", pos(ret)) +
     statTile("Final equity", fmtMoney(r.final_equity)) +
@@ -6195,13 +6344,13 @@ function renderBacktest(r) {
   pushToChart();
 
   status(`backtest · ${r.trades.length} trades · net ${fmtMoney(r.net_profit)}`);
-  openBacktestReport(r, { strategy: "BACKTEST editor" });
+  openBacktestReport(r, { strategy: "BACKTEST editor", ...context });
 }
 
 /* ---------- my data (own CSV imports) ---------- */
 
 async function refreshDatasets() {
-  const [list, folders, ws, nbs] = await Promise.all([
+  const [list, folders, ws, nbs, saved] = await Promise.all([
     fetch("/api/data").then((r) => r.json()).catch(() => []),
     fetch("/api/data/folders").then((r) => r.json()).catch(() => []),
     // Workspace strategies render in the library sidebar too (SCRIPTS
@@ -6211,6 +6360,7 @@ async function refreshDatasets() {
     // renders wherever the tree does. An engine without the
     // route, or hosted mode, yields an empty section, never an error.
     fetch("/api/notebooks").then((r) => (r.ok ? r.json() : [])).catch(() => []),
+    fetch("/api/backtest/saved").then((r) => (r.ok ? r.json() : [])).catch(() => []),
   ]);
   state.datasetList = list;
   // The manifest is what tells the timeframe bar which bars an imported file
@@ -6224,6 +6374,7 @@ async function refreshDatasets() {
   // and this fetch must agree or the tree would show a ghost row.
   state.nbList = (Array.isArray(nbs) ? nbs : [])
     .filter((m) => (m.folder || "") !== ".library");
+  state.savedBacktests = Array.isArray(saved) ? saved : [];
   state.wsFiles = ws.files || [];
   state.wsRoot = ws.root || "";
   state.dataRoot = ws.data_root || "";
@@ -6259,6 +6410,7 @@ const TREE_ICO = {
   lse: `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="6.6" cy="3.6" rx="4.4" ry="1.8"/><path d="M2.2 3.6v6.6c0 1 1.9 1.8 4.4 1.8.5 0 1-.03 1.4-.09"/><path d="M11 3.6v3.1"/><path d="M12.6 8.6v4.2"/><path d="M10.8 11.1l1.8 1.9 1.8-1.9"/></svg>`,
   // Bound pad with a margin line: the NOTEBOOKS rows.
   notebook: `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3.2" y="2" width="9.6" height="12" rx="1.2"/><path d="M5.8 2v12"/><path d="M8 5.2h3.2"/><path d="M8 8h3.2"/><path d="M8 10.8h2.2"/></svg>`,
+  backtest: `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 12.8V3.2"/><path d="M2.2 12.8h11.6"/><path d="m4.2 10.2 2.2-2.3 2 1.2 3.5-4"/><path d="M10.2 5.1h1.7v1.7"/></svg>`,
 };
 
 /* VS Code style file-type icons (the explorer must
@@ -6650,7 +6802,7 @@ function renderLibraryTree(el, ctx) {
     // slot its input row (right under the owning section).
     lab.dataset.sec = sec;
     lab.innerHTML = `${label}<span class="tree-count">${count}</span>` +
-      `<button class="sec-add" data-sec="${sec}" title="${addTitle}">+</button>`;
+      (addTitle ? `<button class="sec-add" data-sec="${sec}" title="${addTitle}">+</button>` : "");
     el.appendChild(lab);
   };
   {
@@ -6765,6 +6917,27 @@ function renderLibraryTree(el, ctx) {
       row.innerHTML = `<span class="tree-ico">${TREE_ICO.notebook}</span>` +
         `<span class="tree-name" title="${mlEsc(nb.name)}">${mlEsc(nb.name)}</span>`;
       row.onclick = () => openNotebookById(nb.id);
+      el.appendChild(row);
+    }
+  }
+  // Durable strategy runs live beside WORKSPACE, DATA and NOTEBOOKS. The
+  // summary rows stay small; opening one fetches the compressed full result.
+  if (ctx !== "nb") {
+    const saved = state.savedBacktests || [];
+    section("PAST BACKTESTS", saved.length, "saved-bt", null);
+    for (const item of saved) {
+      const row = document.createElement("div");
+      row.className = "tree-row tree-script tree-saved-backtest";
+      row.style.paddingLeft = 8 + 15 + "px";
+      const pnl = typeof item.net_profit === "number" ? item.net_profit : null;
+      const when = item.created_at ? new Date(item.created_at * 1000).toLocaleDateString() : "";
+      row.innerHTML = `<span class="tree-ico">${TREE_ICO.backtest || TREE_ICO.script}</span>` +
+        `<span class="tree-name" title="${mlEsc(item.name)}">${mlEsc(item.name)}</span>` +
+        `<span class="tree-meta">${mlEsc([item.symbol, item.total_trades != null ? `${item.total_trades} trades` : "", when].filter(Boolean).join(" · "))}</span>` +
+        (pnl == null ? "" : `<span class="bt-chip ${pnl >= 0 ? "pos" : "neg"}">${pnl >= 0 ? "+" : ""}${fmtCount(Math.round(pnl))}</span>`) +
+        `<span class="md-actions"><button class="saved-bt-del" title="Delete saved backtest" aria-label="Delete saved backtest">&#10005;</button></span>`;
+      row.onclick = (e) => { if (!e.target.closest("button")) openSavedBacktest(item.id); };
+      row.querySelector(".saved-bt-del").onclick = (e) => { e.stopPropagation(); deleteSavedBacktest(item.id); };
       el.appendChild(row);
     }
   }
@@ -8155,6 +8328,25 @@ function closeManualBacktest() {
   $("manual-backtest").classList.add("hidden");
 }
 
+function closeBacktestPages() {
+  closeManualBacktest();
+  // Keep the form and completed reports mounted so navigation preserves work.
+  $("portfolio-backtest").classList.add("hidden");
+}
+
+function openPortfolioBacktest() {
+  subrailMark("sub-bt-portfolio");
+  document.title = "Portfolio Backtest · LSE Terminal";
+  $("portfolio-backtest").classList.remove("hidden");
+  if (!portfolioBacktest.mounted) {
+    window.LSEPortfolioBacktest.mount($("portfolio-builder"), {
+      onResult: (result, context) => openBacktestReport(result, { ...context, editor: "portfolio" }),
+    });
+    portfolioBacktest.mounted = true;
+  }
+  renderPortfolioTabs();
+}
+
 function openManualBacktest() {
   subrailMark("sub-bt-manual");
   $("charts").classList.add("hidden");
@@ -8516,7 +8708,7 @@ function btSaveMode(mode) {
   try { localStorage.setItem("lse.btMode", mode); } catch (e) { /* optional */ }
 }
 
-/* Open the BACKTEST tab in a specific mode ("py" | "manual" | "ml"), or
+/* Open the BACKTEST tab in a specific mode ("py" | "portfolio" | "manual" | "ml"), or
    the last-used one when none is given ("charts", the retired mode, and
    any other stale saved value fall back to py). Algo Development is
    the first-launch default: the old "Choose how you
@@ -8527,7 +8719,7 @@ async function openBacktest(mode) {
   if (!mode) {
     try { mode = localStorage.getItem("lse.btMode"); } catch (e) { /* optional */ }
   }
-  if (!["py", "manual", "ml"].includes(mode)) mode = "py";
+  if (!["py", "portfolio", "manual", "ml"].includes(mode)) mode = "py";
   for (const b of document.querySelectorAll(".rail-btn")) b.classList.remove("active");
   $("rail-backtest").classList.add("active");
   document.title = "Backtest · LSE Terminal";
@@ -8541,7 +8733,7 @@ async function openBacktest(mode) {
                     "research", "guide", "scrpage"]) {
     $(id).classList.add("hidden");
   }
-  closeManualBacktest();
+  closeBacktestPages();
   // Algo Development and ML run on the user's own imported files; flip the
   // source so those modes and the sidebar library inherit it. Manual backtest
   // is exempt: its setup dialog chooses the data source itself (the full LSE
@@ -8551,6 +8743,9 @@ async function openBacktest(mode) {
   if (mode === "manual") {
     btSaveMode("manual");
     openManualBacktest();
+  } else if (mode === "portfolio") {
+    btSaveMode("portfolio");
+    openPortfolioBacktest();
   } else if (mode === "ml") {
     btSaveMode("ml");
     $("mlpage").classList.remove("hidden");
@@ -8591,6 +8786,9 @@ const SUBRAIL = {
         "editor, one-click backtests on any dataset you pick, and the AI " +
         "assistant working in the same folder.",
       go: () => openBacktest("py") },
+    { id: "sub-bt-portfolio", label: "PORTFOLIO BACKTESTING",
+      desc: "Allocate starting capital across saved strategies and imported datasets, then inspect their combined portfolio and individual contributions.",
+      go: () => openBacktest("portfolio") },
     { id: "sub-bt-ml", label: "MACHINE LEARNING",
       desc: "Train 20 models (XGBoost, LSTM, GARCH, regime detection...) " +
         "on your imported data, on this machine's own CPU or GPU. Every " +
@@ -8706,7 +8904,7 @@ function openDataViz() {
                     "research", "guide", "scrpage"]) {
     $(id).classList.add("hidden");
   }
-  closeManualBacktest();
+  closeBacktestPages();
   $("dataviz").classList.remove("hidden");
   if (window.LSEDataViz) window.LSEDataViz.mount($("dataviz-root"));
 }
@@ -8725,7 +8923,7 @@ function openNotebooks() {
                     "lse-connect", "research", "guide", "scrpage"]) {
     $(id).classList.add("hidden");
   }
-  closeManualBacktest();
+  closeBacktestPages();
   $("nbpage").classList.remove("hidden");
   if (window.LSENotebooks) window.LSENotebooks.mount($("nb-root"));
 }
@@ -11521,7 +11719,7 @@ function setupRail() {
     $("wsx").classList.add("hidden");
     $("research").classList.add("hidden");
     $("guide").classList.add("hidden");
-    closeManualBacktest();
+    closeBacktestPages();
     // MARKETS hosts live sources only: LSE and the user's own configured
     // vendors, never imported files. Without an LSE key (and no custom
     // source active) the tab IS the connect form; a user living off their
@@ -11566,7 +11764,7 @@ function setupRail() {
     $("lse-connect").classList.add("hidden");
     $("research").classList.add("hidden");
     $("guide").classList.add("hidden");
-    closeManualBacktest();
+    closeBacktestPages();
     $("mydata").classList.remove("hidden");
     if (state.provider !== "userdata") switchProvider("userdata");
     await refreshLibraryAll();
@@ -11593,7 +11791,7 @@ function setupRail() {
     $("lse-connect").classList.add("hidden");
     $("research").classList.add("hidden");
     $("guide").classList.add("hidden");
-    closeManualBacktest();
+    closeBacktestPages();
     $("econcal").classList.remove("hidden");
     if (window.LSEEconCalendar) {
       window.LSEEconCalendar.mount($("econcal-root"), {
@@ -11623,7 +11821,7 @@ function setupRail() {
     $("lse-connect").classList.add("hidden");
     $("research").classList.add("hidden");
     $("guide").classList.add("hidden");
-    closeManualBacktest();
+    closeBacktestPages();
     $("wsx").classList.remove("hidden");
     // The session is explorer + editor + terminal + CHAT: a collapsed AI
     // rail defeats the point of the tab, so entering it unfolds the rail
@@ -11653,7 +11851,7 @@ function setupRail() {
     $("wsx").classList.add("hidden");
     $("lse-connect").classList.add("hidden");
     $("guide").classList.add("hidden");
-    closeManualBacktest();
+    closeBacktestPages();
     $("research").classList.remove("hidden");
     rsShowView("articles");
   };
@@ -11681,7 +11879,7 @@ function setupRail() {
     $("wsx").classList.add("hidden");
     $("lse-connect").classList.add("hidden");
     $("research").classList.add("hidden");
-    closeManualBacktest();
+    closeBacktestPages();
     $("guide").classList.remove("hidden");
     gdOpen();
   };
@@ -13758,22 +13956,23 @@ async function pyBacktest() {
   const t0 = performance.now();
   pyTermConsole().term.write(`\r\n\x1b[90m$\x1b[0m backtest ${strategy} \x1b[90mon\x1b[0m ${dataset} ${tf}${pinned ? " \x1b[90m(pinned)\x1b[0m" : ""}\r\n`);
   try {
-    const r = await fetch("/api/backtest", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    const requestBody = {
         engine: "python", provider: "userdata", symbol: dataset,
-        timeframe: tf,
-        script,
+        timeframe: tf, script,
         // Local history runs in full; a positive limit would select its tail.
         limit: 0,
-        options: { extended_stats: true },
-      }),
+        options: { extended_stats: true, ...backtestCommissionOptions("py") },
+      };
+    const r = await fetch("/api/backtest", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
     });
     if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
     const res = await r.json();
     pyTermReport(res, performance.now() - t0);
     renderPlotPanes("py-plots", res.plots);
-    openBacktestReport(res, { editor: "py", strategy, elapsedMs: performance.now() - t0 });
+    openBacktestReport(res, { editor: "py", strategy, elapsedMs: performance.now() - t0,
+      request: requestBody });
     // Remember the run per script so the library's SCRIPTS chips show the
     // last result next to the file name.
     if (typeof res.net_profit === "number") {
@@ -13839,6 +14038,8 @@ function pyTermReport(res, ms, term) {
   const s = res.stats || {};
   const pf = s.profitFactor === "__+Inf__" ? "inf" : num(s.profitFactor);
   const rows = [
+    ["gross P&L", Number.isFinite(res.gross_profit) ? pnlc(res.gross_profit) : "unavailable"],
+    ["commission", Number.isFinite(res.total_commission) ? num(res.total_commission) : "unavailable"],
     ["net profit", pnlc(res.net_profit)],
     ["final equity", num(res.final_equity)],
     ["trades", `${trades.length}  ${D}(${s.winningTrades ?? 0} win / ${s.losingTrades ?? 0} loss)${X}`],
@@ -14478,22 +14679,19 @@ async function wsxBacktest() {
   const t0 = performance.now();
   t.write(`\r\n\x1b[90m$\x1b[0m backtest ${strategy} \x1b[90mon\x1b[0m ${dataset} ${tf}${pinned ? " \x1b[90m(pinned)\x1b[0m" : ""}\r\n`);
   try {
+    const requestBody = {
+      engine: "python", provider: "userdata", symbol: dataset, timeframe: tf, script,
+      limit: 0, options: { extended_stats: true, ...backtestCommissionOptions("wsx") },
+    };
     const r = await fetch("/api/backtest", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        engine: "python", provider: "userdata", symbol: dataset,
-        timeframe: tf,
-        script,
-        // Local history runs in full, matching the BACKTEST tab.
-        limit: 0,
-        options: { extended_stats: true },
-      }),
+      body: JSON.stringify(requestBody),
     });
     if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
     const res = await r.json();
     pyTermReport(res, performance.now() - t0, t);
     renderPlotPanes("wsx-plots", res.plots);
-    openBacktestReport(res, { editor: "wsx", strategy, elapsedMs: performance.now() - t0 });
+    openBacktestReport(res, { editor: "wsx", strategy, elapsedMs: performance.now() - t0, request: requestBody });
     // Same last-run bookkeeping as the BACKTEST tab; the library chips key
     // on the workspace path, which both editors share.
     if (typeof res.net_profit === "number") {

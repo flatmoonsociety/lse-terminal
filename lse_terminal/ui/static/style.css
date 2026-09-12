@@ -1061,15 +1061,36 @@ section#charts { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 /* Completed runs occupy the editor area and use its existing tab strip. */
 .backtest-report-host { flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
 .backtest-report-host.hidden { display: none; }
+.bt-fee-controls {
+  display: flex; align-items: center; flex-wrap: wrap; flex: none; gap: 6px 12px;
+  padding: 7px 10px; border-bottom: 1px solid var(--edge); color: var(--dim); font-size: 11px;
+}
+.bt-fee-controls label { display: inline-flex; align-items: center; gap: 5px; }
+.bt-fee-controls input { width: 90px; }
+.bt-fee-controls p { flex-basis: 100%; margin: 0; font-size: 10px; }
+#py-main.report-active #py-fees, #wsx-main.report-active #wsx-fees { display: none; }
 #py-main.report-active { min-height: 0; overflow: hidden; }
 #py-main.report-active #py-edwrap, #py-main.report-active #py-preview,
 #py-main.report-active #py-run, #py-main.report-active #py-dataset-label,
 #wsx-main.report-active #wsx-edwrap, #wsx-main.report-active #wsx-run { display: none; }
 .report-tab button:focus-visible { outline: 2px solid var(--up); outline-offset: -2px; }
-#py-bar .report-tab-open, #wsx-tabs-row .report-tab-open {
+#py-bar .report-tab-open, #wsx-tabs-row .report-tab-open, #portfolio-tabs .report-tab-open {
   background: none; border: 0; color: inherit; font: inherit; letter-spacing: normal;
   padding: 0; text-transform: none; cursor: pointer;
 }
+
+#portfolio-backtest, #portfolio-main {
+  display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden;
+}
+#portfolio-builder { flex: 1; min-height: 0; overflow: hidden; }
+#portfolio-main.report-active #portfolio-builder { display: none; }
+#portfolio-tabs {
+  display: flex; flex: none; min-height: 38px; overflow-x: auto;
+  background: var(--bg2); border-bottom: 1px solid var(--edge);
+}
+#portfolio-tabs .py-tab { flex: none; }
+#portfolio-tabs .py-tab-x { cursor: pointer; }
+#portfolio-tabs > button:focus-visible { outline: 2px solid var(--up); outline-offset: -2px; }
 
 /* AI rail: full-height right panel across the whole terminal. It is a flex
    sibling of the sections inside <main>, so the active section (chart,
@@ -2145,6 +2166,18 @@ html:not(.dark) .air-menu-item.on.sel { background: #c6cad1; }
 .bt-chip { flex: none; margin-left: auto; font-size: 10px; font-family: var(--mono); color: var(--dim); }
 .bt-chip.pos { color: var(--up); }
 .bt-chip.neg { color: var(--down); }
+.tree-saved-backtest {
+  display: grid; grid-template-columns: 16px minmax(0, 1fr) auto;
+  column-gap: 6px; row-gap: 2px; padding-top: 5px; padding-bottom: 5px;
+}
+.tree-saved-backtest .tree-ico { grid-column: 1; grid-row: 1 / 3; }
+.tree-saved-backtest .tree-name { grid-column: 2; grid-row: 1; min-width: 0; }
+.tree-saved-backtest .bt-chip { grid-column: 3; grid-row: 1; margin-left: 0; }
+.tree-saved-backtest .tree-meta {
+  grid-column: 2 / 4; grid-row: 2; min-width: 0; margin-left: 0; padding-right: 20px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.tree-saved-backtest:hover .md-actions { top: auto; bottom: 3px; transform: none; }
 
 /* indicator browser + parameter editor (JS-positioned dropdown cards) */
 #ind-panel, #ind-cfg, #tpl-panel {

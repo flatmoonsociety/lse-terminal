@@ -282,6 +282,21 @@ def _parse_when(value) -> float | None:
     return num / 1000.0 if num > 1e11 else num
 
 
+def _commission_options(options: dict) -> tuple[float, float]:
+    """Per-side percent of absolute notional and cash per actual unit."""
+    values = []
+    for name in ("commission_pct", "commission_per_unit"):
+        try:
+            raw = options.get(name, 0)
+            value = float(raw) if raw is not None else 0.0
+            if not math.isfinite(value) or value < 0:
+                raise ValueError()
+        except (TypeError, ValueError, OverflowError):
+            raise BacktestError(f"{name} must be a finite nonnegative number") from None
+        values.append(value)
+    return values[0], values[1]
+
+
 def _user_lineno(exc: BaseException) -> int | None:
     """Deepest frame belonging to the user's script, for the error message."""
     lineno = None
@@ -325,7 +340,7 @@ class PythonRunner(BacktestEngine):
 
         capital = float(options.get("capital",
                                     options.get("initial_capital", 100_000)))
-        commission_pct = float(options.get("commission_pct", 0) or 0)
+        commission_pct, commission_per_unit = _commission_options(options)
 
         # Per-run deadline; walk-forward therefore bounds each fold, not the
         # whole sweep, which is the behaviour a param grid needs.
@@ -336,7 +351,11 @@ class PythonRunner(BacktestEngine):
             symbol=symbol, timeframe=timeframe)
         trades = self._normalize(raw, df)
         equity_curve, final_equity, bars_in_market = self._account(
-            trades, df, capital, commission_pct / 100.0)
+            trades, df, capital, commission_pct / 100.0, commission_per_unit)
+        total_commission = float(sum(t.commission for t in trades))
+        gross_profit = float(sum(t.gross_pnl for t in trades))
+        if not all(math.isfinite(value) for value in (final_equity, total_commission, gross_profit)):
+            raise BacktestError("Accounting values overflowed; reduce commission rates or quantities")
         benchmark_curve = self._benchmark_curve(df, capital)
 
         stats = self._stats(trades, equity_curve, capital, final_equity,
@@ -347,6 +366,8 @@ class PythonRunner(BacktestEngine):
             net_profit=final_equity - capital,
             stats=stats, trades=trades, equity_curve=equity_curve,
             benchmark_curve=benchmark_curve, plots=plots,
+            total_commission=total_commission, gross_profit=gross_profit,
+            commission_pct=commission_pct, commission_per_unit=commission_per_unit,
         )
 
     @staticmethod
@@ -594,7 +615,7 @@ class PythonRunner(BacktestEngine):
     # ── the accounting ────────────────────────────────────────────────
 
     def _account(self, trades: list[Trade], df: pd.DataFrame, capital: float,
-                 commission_rate: float) -> tuple[list[list[float]], float, int]:
+                 commission_rate: float, commission_per_unit: float = 0.0) -> tuple[list[list[float]], float, int]:
         """Size the trades, charge commission, and build the equity curve.
 
         Sizing default is the whole account, compounding trade to trade, so a
@@ -642,7 +663,10 @@ class PythonRunner(BacktestEngine):
                 sized[k] = qty
                 notional = t.entry_price * qty * t.point_value
                 committed += notional
-                fee = notional * commission_rate
+                fee = abs(notional) * commission_rate + qty * commission_per_unit
+                if not math.isfinite(fee):
+                    raise BacktestError("Entry commission overflowed; reduce the rate or quantity")
+                t.entry_commission = float(fee)
                 cash -= fee
                 realized[bar] -= fee
             else:
@@ -651,13 +675,20 @@ class PythonRunner(BacktestEngine):
                     gross = (t.exit_price - t.entry_price) * qty * t.point_value
                 else:
                     gross = (t.entry_price - t.exit_price) * qty * t.point_value
-                fee = t.exit_price * qty * t.point_value * commission_rate
-                entry_fee = t.entry_price * qty * t.point_value * commission_rate
+                fee = abs(t.exit_price * qty * t.point_value) * commission_rate + qty * commission_per_unit
+                if not math.isfinite(fee):
+                    raise BacktestError("Exit commission overflowed; reduce the rate or quantity")
+                entry_fee = t.entry_commission
                 cash += gross - fee
                 realized[bar] += gross - fee
                 committed -= t.entry_price * qty * t.point_value
                 notional = t.entry_price * qty * t.point_value
                 t.qty = float(qty)
+                t.exit_commission = float(fee)
+                t.commission = float(entry_fee + fee)
+                if not math.isfinite(t.commission):
+                    raise BacktestError("Round-trip commission overflowed; reduce the rate or quantity")
+                t.gross_pnl = float(gross)
                 t.pnl = float(gross - fee - entry_fee)
                 t.pnl_pct = float(t.pnl / notional * 100.0) if notional else 0.0
 
@@ -696,8 +727,9 @@ class PythonRunner(BacktestEngine):
     def montecarlo(self, script: str, candles: pd.DataFrame,
                    runs: int = 1000, seed: int = 42,
                    options: dict | None = None,
-                   data_files: dict | None = None) -> dict:
-        res = self.run(script, candles, "", "", options=options,
+                   data_files: dict | None = None, *,
+                   symbol: str = "", timeframe: str = "") -> dict:
+        res = self.run(script, candles, symbol, timeframe, options=options,
                        data_files=data_files)
         pnls = [t.pnl for t in res.trades if t.pnl is not None]
         try:
@@ -710,7 +742,8 @@ class PythonRunner(BacktestEngine):
                     params: dict[str, str], folds: int = 4, train: float = 0.7,
                     metric: str = "netProfit",
                     options: dict | None = None,
-                    data_files: dict | None = None) -> dict:
+                    data_files: dict | None = None, *,
+                    symbol: str = "", timeframe: str = "") -> dict:
         """Re-fit on each training window, measure on the untouched window
         after it. The script reads its knobs from `params`, which is the only
         reason that name is injected."""
@@ -766,8 +799,8 @@ class PythonRunner(BacktestEngine):
                 "not enough bars for the requested train fraction")
 
         def one(window: pd.DataFrame, combo):
-            opts = {**options, "params": dict(combo)}
-            res = self.run(script, window.reset_index(drop=True), "", "",
+            opts = {**options, "params": {**(options.get("params") or {}), **dict(combo)}}
+            res = self.run(script, window.reset_index(drop=True), symbol, timeframe,
                            options=opts, data_files=data_files)
             pf = res.stats.get("profitFactor")
             vals = {"netProfit": res.net_profit,
@@ -787,15 +820,23 @@ class PythonRunner(BacktestEngine):
             train_end = test_start - 1
             best = None
             last_err = None
+            candidates = []
             for ci, combo in enumerate(combos):
+                candidate = {"params": dict(combo), "metricValue": None,
+                             "netProfit": None, "trades": None}
+                candidates.append(candidate)
                 try:
-                    m, net, _ = one(df.iloc[train_start:train_end + 1], combo)
+                    m, net, trades = one(df.iloc[train_start:train_end + 1], combo)
                 except BacktestError as e:
+                    candidate["error"] = str(e)
                     if len(combos) == 1:
                         raise
                     last_err = e     # a contract error fails every combo the
                     continue         # same way; surface it, not a generic line
+                candidate.update(metricValue=research.jnum(m),
+                                 netProfit=research.jnum(net), trades=trades)
                 if math.isnan(m):
+                    candidate["error"] = "Training metric is undefined"
                     continue
                 if best is None or m > best[1]:
                     best = (ci, m, net)
@@ -819,6 +860,11 @@ class PythonRunner(BacktestEngine):
                 "fold": k,
                 "trainStart": train_start, "trainEnd": train_end,
                 "testStart": test_start, "testEnd": test_end,
+                "trainStartTs": int(df.ts.iloc[train_start]),
+                "trainEndTs": int(df.ts.iloc[train_end]),
+                "testStartTs": int(df.ts.iloc[test_start]),
+                "testEndTs": int(df.ts.iloc[test_end]),
+                "candidates": candidates,
                 "bestParams": {name: v for name, v in combos[best_ci]},
                 "trainMetric": research.jnum(train_metric),
                 "trainNetProfit": train_net,
@@ -826,6 +872,12 @@ class PythonRunner(BacktestEngine):
                 "efficiency": research.jnum(eff),
             })
         return {"type": "walkforward", "metric": metric,
+                "methodology": {
+                    "selection": "Training metric only; only the selected candidate is run on the next test window.",
+                    "windows": "Rolling windows split by bar count; boundaries can fall inside sessions.",
+                    "state": "Every training and test run starts fresh with the same initial capital; no warmup state is carried forward.",
+                    "data": "Uses the currently supplied history; not evidence of untouched holdout data or correction for prior strategy selection.",
+                },
                 "combosPerFold": len(combos), "folds": out_folds,
                 "totalOosNetProfit": total_oos,
                 "totalOosTrades": total_oos_trades,
@@ -863,19 +915,22 @@ class PythonRunner(BacktestEngine):
         gross_loss = float(sum(losses))     # negative sum, kept for continuity
 
         eq = np.array([e for _, e in equity_curve], dtype="float64")
-        peak = np.maximum.accumulate(eq) if len(eq) else eq
+        # Entry fees or losses on the first observed bar draw down initial cash.
+        peak = np.maximum.accumulate(np.maximum(eq, capital)) if len(eq) else eq
         dd_abs = float((peak - eq).max()) if len(eq) else 0.0
         with np.errstate(divide="ignore", invalid="ignore"):
             dd_pct_series = np.where(peak > 0, (peak - eq) / peak, 0.0)
         dd_pct = float(dd_pct_series.max() * 100.0) if len(eq) else 0.0
 
-        # Per-bar returns annualized off the median bar spacing, so any
-        # timeframe (or irregular imported data) gets a sane Sharpe.
-        rets = np.diff(eq) / eq[:-1] if len(eq) > 1 else np.array([])
-        rets = rets[np.isfinite(rets)]
+        # Use elapsed calendar time: counting bars drops nights, weekends and
+        # missing sessions and overstates both CAGR and annualized risk metrics.
         ts_arr = np.array([t for t, _ in equity_curve], dtype="float64")
-        bar_s = float(np.median(np.diff(ts_arr))) if len(ts_arr) > 1 else 3600.0
-        bars_per_year = _YEAR_SECONDS / bar_s if bar_s > 0 else 8760.0
+        years = ((ts_arr[-1] - ts_arr[0]) / _YEAR_SECONDS
+                 if len(ts_arr) > 1 else 0.0)
+        rets = (np.diff(eq) / eq[:-1]
+                if len(eq) > 1 and np.all(eq > 0) else np.array([]))
+        rets = rets[np.isfinite(rets)]
+        bars_per_year = len(rets) / years if years > 0 else 0.0
         if len(rets) > 1 and rets.std(ddof=1) > 0:
             sharpe = float(rets.mean() / rets.std(ddof=1)
                            * math.sqrt(bars_per_year))
@@ -919,13 +974,17 @@ class PythonRunner(BacktestEngine):
         }
 
         if extended:
-            years = (len(eq) / bars_per_year) if bars_per_year else 0.0
-            if years > 0 and capital > 0 and final_equity > 0:
-                ann_return = ((final_equity / capital) ** (1 / years) - 1) * 100.0
-            else:
-                ann_return = 0.0
+            ann_return = None
+            if years > 0 and capital > 0 and final_equity > 0 and np.all(eq > 0):
+                try:
+                    ann_return = math.expm1(
+                        (math.log(final_equity) - math.log(capital)) / years) * 100.0
+                except OverflowError:
+                    pass
+                if ann_return is not None and not math.isfinite(ann_return):
+                    ann_return = None
             neg = rets[rets < 0]
-            if len(rets) > 1 and len(neg) and neg.std(ddof=1) > 0:
+            if len(rets) > 1 and len(neg) > 1 and neg.std(ddof=1) > 0:
                 sortino = float(rets.mean() / neg.std(ddof=1)
                                 * math.sqrt(bars_per_year))
             else:
@@ -938,7 +997,8 @@ class PythonRunner(BacktestEngine):
                 "cvar99": (float(-rets[rets <= np.percentile(rets, 1)].mean())
                            if len(rets) else 0.0),
                 "sortino": sortino,
-                "calmar": (ann_return / dd_pct) if dd_pct > 0 else 0.0,
+                "calmar": ((ann_return / dd_pct if dd_pct > 0 else 0.0)
+                           if ann_return is not None else None),
                 "annualizedReturn": ann_return,
                 "annualizedVol": (float(rets.std(ddof=1)
                                         * math.sqrt(bars_per_year) * 100.0)

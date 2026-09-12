@@ -337,12 +337,13 @@ def my_ind(df, length=20):
           </span>
           <span id="bt-datasets" title="Attach alternative datasets as `use` bindings"></span>
           <span id="bt-wf-opts" class="hidden">
-            <label>Params <input id="bt-wf-params" placeholder="len=5:30:5, mult=1,2,3"
-              title="{{name}} placeholders in the script; grid as lo:hi:step or v1,v2"></label>
+            <label>Params <input id="bt-wf-params" placeholder="length=5:30:5, mult=1,2,3"
+              title="Read parameters with params.get('name', default); grid as lo:hi:step or v1,v2"></label>
             <label>Folds <input id="bt-wf-folds" type="number" value="4" min="1" max="20"></label>
             <label>Train <input id="bt-wf-train" type="number" value="0.7" min="0.1" max="0.9" step="0.05"></label>
           </span>
         </div>
+        <div id="bt-fees" class="bt-fee-controls"></div>
         <textarea id="bt-src" spellcheck="false"></textarea>
         <pre id="bt-err" class="hidden"></pre>
       </div>
@@ -384,6 +385,13 @@ def my_ind(df, length=20):
   </section>
   <!-- Host for the ported manual backtester (mounted on demand). -->
   <section id="manual-backtest" class="hidden"></section>
+  <section id="portfolio-backtest" class="hidden" aria-label="Portfolio backtesting">
+    <div id="portfolio-main">
+      <div id="portfolio-tabs" aria-label="Portfolio setup and reports"></div>
+      <div id="portfolio-builder"></div>
+      <div id="portfolio-report" class="backtest-report-host hidden"></div>
+    </div>
+  </section>
   <!-- Connection screen: the full-surface version of the little conn-menu
        dropdown. Opened from #conn-bar. Same information architecture (the LSE
        data connection first, then brokers) with room for logos, taglines and
@@ -511,6 +519,7 @@ def my_ind(df, length=20):
         <button id="py-run">RUN</button>
         <button id="py-stop" class="hidden">&#9632; STOP</button>
       </div>
+      <div id="py-fees" class="bt-fee-controls"></div>
       <!-- Dataset preview: clicking a data file in
            the library swaps the editor for its columns and a 100-row
            sample, VS Code style (click a file, see the file); the click
@@ -829,6 +838,7 @@ def my_ind(df, length=20):
         <span class="ml-code-spacer"></span>
         <button id="wsx-run" title="Run the open file below: a strategy runs as a backtest, anything else as a script">RUN</button>
       </div>
+      <div id="wsx-fees" class="bt-fee-controls"></div>
       <div id="wsx-report" class="backtest-report-host hidden" role="region" aria-label="Backtest report"></div>
       <div id="wsx-edwrap">
         <!-- Highlight backdrop: the textarea's text is transparent, this pre
