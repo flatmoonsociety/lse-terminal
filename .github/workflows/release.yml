@@ -16,21 +16,28 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build
+        required: true
+        type: string
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 permissions:
   contents: read
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 jobs:
   version:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.tag || github.ref }}" }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: Check release version consistency
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           python - <<'PY'
           import ast
@@ -74,7 +81,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-        with: { path: lse-terminal }
+        with: { path: lse-terminal, ref: "${{ inputs.tag || github.ref }}" }
       - uses: actions/checkout@v4
         with: { repository: londonstrategicedge/brue, ref: a846522fe8af0e11ee7739ef8b6b8a4c0f7922cb, path: brue }
       - uses: actions/checkout@v4
@@ -135,7 +142,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-        with: { path: lse-terminal }
+        with: { path: lse-terminal, ref: "${{ inputs.tag || github.ref }}" }
       - uses: actions/checkout@v4
         with: { repository: londonstrategicedge/brue, ref: a846522fe8af0e11ee7739ef8b6b8a4c0f7922cb, path: brue }
       - uses: actions/checkout@v4
@@ -191,6 +198,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.tag || github.ref }}" }
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
       - name: Install release metadata tools
@@ -217,12 +225,11 @@ jobs:
                       raise SystemExit(f"Missing or empty release asset: {artifact}/{pattern}")
           PY
       - name: Merge macOS update metadata and generate checksums
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
         run: node desktop/prepare-release.js out release-assets "$RELEASE_TAG"
       - uses: softprops/action-gh-release@v2
         with:
           draft: true
+          tag_name: ${{ env.RELEASE_TAG }}
           fail_on_unmatched_files: true
-          body_path: docs/releases/${{ github.ref_name }}.md
+          body_path: docs/releases/${{ env.RELEASE_TAG }}.md
           files: release-assets/*
