@@ -697,7 +697,7 @@ html:not(.dark) #inq-actions button:hover { background: #cfd3d9; border-color: #
 .cs-pickstate.upd { color: var(--text); }
 .cs-bupd { color: var(--dim); font-size: 12px; line-height: 1.5; margin: 2px 0 8px; }
 
-/* LSE databank import modal. Same zinc chrome as the other modals; three
+/* Market data import modal. Same zinc chrome as the other modals; three
    panes (datasets / instruments / pull settings) because the catalog is 20k+
    instruments and needs browse-then-search, not one flat form. */
 .src-help { color: var(--dim); font-size: 12px; margin-bottom: 10px; line-height: 1.5; }
@@ -716,6 +716,10 @@ html:not(.dark) #inq-actions button:hover { background: #cfd3d9; border-color: #
   font-size: 13px; font-weight: 700; margin-bottom: 6px; }
 #lsb-head button { border: none; background: transparent; color: var(--dim); font-size: 15px; }
 #lsb-head button:hover { color: var(--text); }
+#lsb-provider-wrap { display: flex; align-items: center; gap: 10px; color: var(--dim); font-size: 12px; }
+#lsb-provider { min-width: 190px; font-size: 13px; }
+#lsb-card.busy .lsb-set, #lsb-card.busy .lsb-row { pointer-events: none; opacity: .6; }
+#lsb-card.busy input, #lsb-card.busy select, #lsb-card.busy .lsb-chip { opacity: .6; }
 #lsb-key-hint { color: var(--dim); font-size: 12.5px; padding: 18px 4px; }
 #lsb-body { flex: 1; display: flex; gap: 10px; min-height: 0; }
 #lsb-body.hidden { display: none; }
@@ -765,6 +769,13 @@ html:not(.dark) #inq-actions button:hover { background: #cfd3d9; border-color: #
 #lsb-status.err { color: var(--err); font-family: var(--mono); }
 #lsb-status.hidden { display: none; }
 #lsb-quota { margin-top: auto; font-size: 11px; }
+@media (max-width: 640px) {
+  #lsb-card { width: 96vw; height: 94vh; padding: 10px; }
+  #lsb-body { flex-wrap: wrap; overflow-y: auto; }
+  #lsb-sets { width: 112px; max-height: 180px; }
+  #lsb-mid { min-width: 150px; height: 180px; }
+  #lsb-side { width: 100%; overflow: visible; }
+}
 section#charts { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 
 /* The BACKTEST mode-chooser page was retired; the .bt-choice-* layout

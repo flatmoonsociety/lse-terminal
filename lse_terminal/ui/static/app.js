@@ -6537,14 +6537,14 @@ function renderLibraryTree(el, ctx) {
   el.appendChild(head);
   // The toolbar is labeled buttons, not bare icons: "which tiny glyph is
   // new-folder" was a real usability complaint.
-  // Import via LSE rides its own full-width row ABOVE the local-file actions:
+  // Market data import rides its own full-width row ABOVE the local-file actions:
   // it is the headline door to data, and a fourth
   // button in the shared row would not fit the sidebar width anyway.
   const lseRow = document.createElement("div");
   lseRow.className = "tree-actions";
   lseRow.innerHTML =
-    `<button id="tree-lse" title="Browse the LSE databank and download full history into your library">` +
-    `${TREE_ICO.lse}<span>Import via LSE Data</span></button>`;
+    `<button id="tree-lse" title="Choose a data provider and download history into your library">` +
+    `${TREE_ICO.lse}<span>Import market data</span></button>`;
   el.appendChild(lseRow);
   lseRow.querySelector("#tree-lse").onclick = () => openLsbModal();
   const bar = document.createElement("div");
@@ -6640,8 +6640,8 @@ function renderLibraryTree(el, ctx) {
     const empty = document.createElement("div");
     empty.className = "empty-actions";
     empty.innerHTML = '<div class="md-empty">Library is empty. Pull history ' +
-      'from the LSE databank, import a data file, or start a strategy script.</div>' +
-      '<button id="empty-lse">Import via LSE Data</button>' +
+      'from a data provider, import a data file, or start a strategy script.</div>' +
+      '<button id="empty-lse">Import market data</button>' +
       '<button id="empty-data">Upload a data file</button>' +
       '<button id="empty-folder2">New folder</button>' +
       '<button id="empty-script">New script</button>';
@@ -7484,13 +7484,15 @@ function showMdError(msg) {
   $("md-err").classList.remove("hidden");
 }
 
-/* ---------- LSE databank import (library > Import via LSE) ----------
+/* ---------- Market data import (library > Import market data) ----------
    Browse the vault catalog, pick, download. The engine does the heavy part
    (submit export, poll, pull Parquet, land it in the library); this modal is
    only the picker plus a job status line. */
 
-const lsb = { meta: null, ref: [], usage: null, dataset: null, row: null,
-              timer: null, seq: 0, tf: "1h", range: "max" };
+const lsb = { provider: "lse", meta: null, ref: [], usage: null, dataset: null, row: null,
+              timer: null, seq: 0, metaSeq: 0, tf: "1h", range: "max", busy: false, job: null };
+const lsbApi = (provider = lsb.provider) => `/api/${provider}/databank`;
+const lsbProviderName = (provider = lsb.provider) => provider === "binance" ? "Binance" : "LSE";
 
 // Range presets fill the date inputs so nobody types dd/mm/yyyy by hand.
 // Day-based labels, not "1m/1w", so they can never be misread as the
@@ -7503,7 +7505,7 @@ const LSB_RANGE_DAYS = { "1y": 365, "180d": 180, "90d": 90, "30d": 30, "7d": 7 }
 const LSB_NAMES = {
   fx: "Forex", etf: "ETFs", index: "Indices", commodity: "Commodities",
   cot: "COT positioning", economics: "Economics",
-  currency_index: "Currency index", fx_derivatives: "FX derivatives",
+  currency_index: "Currency index", fx_derivatives: "FX derivatives", spot: "Spot crypto",
 };
 const lsbName = (id) => LSB_NAMES[id] ||
   (id.charAt(0).toUpperCase() + id.slice(1)).replace(/_/g, " ");
@@ -7521,41 +7523,64 @@ const lsbIsCandle = (ds) => (lsb.meta?.candle_classes || []).includes(ds) ||
 
 async function openLsbModal() {
   $("lsb-modal").classList.remove("hidden");
+  $("lsb-provider").value = lsb.provider;
+  $("lsb-help").textContent = lsb.provider === "binance"
+    ? "Download Binance Spot candles through its public API; no API key needed. Dates are UTC. Max downloads all available closed candles into your library."
+    : "Your LSE key unlocks the databank's recorded history. Candles and series go into your library; raw exports stay as Parquet files.";
+  if (lsb.busy) return; // Closing the picker never interrupts or forgets an import.
   if (!lsb.meta) {
-    let r;
-    try { r = await fetch("/api/lse/databank"); } catch (e) { r = null; }
-    if (!r || !r.ok) {
-      $("lsb-body").classList.add("hidden");
-      const hint = $("lsb-key-hint");
-      hint.classList.remove("hidden");
-      if (r && r.status !== 409 && r.status !== 404) {
-        let detail = "";
-        try { detail = (await r.json()).detail || ""; } catch (e) { /* keep */ }
-        // The engine labels the error itself ("Databank: <service words>" for
-        // a bad key or a quota, "Databank unreachable: ..." for transport
-        // failures); only a body-less response needs a label here.
-        hint.textContent = detail || `Databank unreachable (HTTP ${r.status})`;
+    const provider = lsb.provider, seq = ++lsb.metaSeq;
+    const hint = $("lsb-key-hint");
+    $("lsb-body").classList.add("hidden");
+    hint.classList.remove("hidden");
+    hint.textContent = `Loading ${lsbProviderName(provider)}…`;
+    try {
+      const r = await fetch(lsbApi(provider));
+      if (seq !== lsb.metaSeq) return;
+      if (!r.ok) {
+        const detail = provider === "lse" && (r.status === 409 || r.status === 404)
+          ? "No LSE API key set. Add your free key under MARKETS first; the databank uses the same key."
+          : await lsbResponseError(r);
+        if (seq === lsb.metaSeq) hint.textContent = detail;
+        return;
       }
+      const d = await r.json();
+      if (seq !== lsb.metaSeq) return;
+      lsb.meta = d.meta || {};
+      lsb.ref = d.reference || [];
+      lsb.usage = d.usage;
+      renderLsbSets();
+      renderLsbQuota();
+    } catch (e) {
+      if (seq === lsb.metaSeq) hint.textContent = `Could not load ${lsbProviderName(provider)}: ${e.message}`;
       return;
     }
-    const d = await r.json();
-    lsb.meta = d.meta || {};
-    lsb.ref = d.reference || [];
-    lsb.usage = d.usage;
-    renderLsbSets();
-    renderLsbQuota();
   }
   $("lsb-key-hint").classList.add("hidden");
   $("lsb-body").classList.remove("hidden");
-  // Folder suggestions from the live folder list; default to an LSE folder
+  // Folder suggestions from the live folder list; default to a provider folder
   // so pulls do not flood the library root.
   $("lsb-folders").innerHTML = (state.folderList || [])
     .map((f) => `<option value="${lsbEsc(f)}">`).join("");
-  if (!$("lsb-folder").value) $("lsb-folder").value = "LSE";
+  if (!$("lsb-folder").value) $("lsb-folder").value = lsbProviderName();
   if (!lsb.dataset) {
     const first = (lsb.meta.candle_classes || [])[0];
     if (first) lsbPickSet(first);
   }
+}
+
+async function lsbResponseError(response) {
+  let detail;
+  try { detail = (await response.json()).detail; } catch (e) { /* use HTTP status */ }
+  return typeof detail === "string" ? detail : detail ? JSON.stringify(detail) : `HTTP ${response.status}`;
+}
+
+function lsbSetBusy(busy) {
+  lsb.busy = busy;
+  $("lsb-card").classList.toggle("busy", busy);
+  $("lsb-provider").disabled = busy;
+  for (const node of $("lsb-body").querySelectorAll("input, button")) node.disabled = busy;
+  setLsbDetail();
 }
 
 function renderLsbSets() {
@@ -7589,6 +7614,8 @@ function renderLsbSets() {
 
 function renderLsbQuota() {
   const u = lsb.usage;
+  $("lsb-quota").textContent = lsb.provider === "binance"
+    ? "Public API limits apply; downloads pause and retry when Binance requests it." : "";
   if (!u || u.bytes_used_month == null) return;
   const cap = u.bytes_cap_month;
   $("lsb-quota").textContent = "Downloaded this month: " +
@@ -7597,6 +7624,8 @@ function renderLsbQuota() {
 }
 
 function lsbPickSet(ds) {
+  if (lsb.busy) return;
+  ++lsb.seq;
   lsb.dataset = ds;
   lsb.row = null;
   for (const n of document.querySelectorAll(".lsb-set"))
@@ -7608,7 +7637,7 @@ function lsbPickSet(ds) {
   if (lsbIsCandle(ds)) {
     const tfs = ds === "options" ? (lsb.meta.options_timeframes || [])
                                  : (lsb.meta.timeframes || []);
-    const all = ["tick", ...tfs];
+    const all = lsb.provider === "binance" ? tfs : ["tick", ...tfs];
     // The picked timeframe survives dataset hops when the new dataset offers
     // it; otherwise fall back to the 1h default.
     if (!all.includes(lsb.tf)) lsb.tf = all.includes("1h") ? "1h" : all[0];
@@ -7616,6 +7645,7 @@ function lsbPickSet(ds) {
   }
   lsbApplyBounds();
   lsbApplyRange();
+  setLsbDetail();
   if (lsbIsRef(ds)) {
     const meta = lsb.ref.find((r) => r.dataset === ds);
     $("lsb-search").style.display = "none";
@@ -7647,20 +7677,34 @@ function lsbLogoMap() {
 }
 
 async function lsbSearchNow() {
+  if (lsb.busy || !lsb.dataset || lsbIsRef(lsb.dataset)) return;
   const seq = ++lsb.seq;
+  const provider = lsb.provider;
   const q = $("lsb-search").value.trim();
-  const r = await fetch(`/api/lse/databank/catalog?dataset=` +
-    `${encodeURIComponent(lsb.dataset)}&query=${encodeURIComponent(q)}&limit=400`);
-  if (!r.ok || seq !== lsb.seq) return;
-  const d = await r.json();
   const el = $("lsb-list");
+  el.textContent = "Loading instruments…";
+  let d;
+  try {
+    const r = await fetch(`${lsbApi(provider)}/catalog?dataset=` +
+      `${encodeURIComponent(lsb.dataset)}&query=${encodeURIComponent(q)}&limit=400`);
+    if (!r.ok) throw new Error(await lsbResponseError(r));
+    d = await r.json();
+  } catch (e) {
+    if (seq === lsb.seq) {
+      el.textContent = `Could not load instruments: ${e.message}`;
+      lsb.row = null;
+      setLsbDetail();
+    }
+    return;
+  }
+  if (seq !== lsb.seq || lsb.busy) return;
   el.innerHTML = "";
   // Instrument art on every row, the same .wlogo tile
   // the watchlist and the ticket use: art from the LSE map (the databank is
   // the LSE symbol space), a monogram while it loads or when there is none
   // (series, bonds, options). The map is fetched once per session; when it
   // lands after this render the list redraws once.
-  const logos = lsbLogoMap();
+  const logos = provider === "lse" ? lsbLogoMap() : {};
   const dark = document.documentElement.classList.contains("dark");
   for (const row of d.rows) {
     const n = document.createElement("div");
@@ -7674,6 +7718,7 @@ async function lsbSearchNow() {
       `<span class="nm">${lsbEsc(row.name)}</span>` +
       `<span class="span">${row.years ? row.years + "y" : ""}</span>`;
     n.onclick = () => {
+      if (lsb.busy) return;
       lsb.row = row;
       for (const x of el.children) x.classList.toggle("sel", x === n);
       // Re-anchor the date presets to THIS instrument's coverage: "30d" means
@@ -7685,6 +7730,7 @@ async function lsbSearchNow() {
     };
     el.appendChild(n);
   }
+  if (!d.rows.length) el.textContent = "No instruments found. Try another symbol or asset name.";
   if (d.rows.length < d.total) {
     const more = document.createElement("div");
     more.className = "md-help";
@@ -7704,6 +7750,7 @@ function renderLsbTf(tfs) {
     b.className = "lsb-chip" + (t === lsb.tf ? " sel" : "");
     b.textContent = t;
     b.onclick = () => {
+      if (lsb.busy) return;
       lsb.tf = t;
       for (const x of el.children) x.classList.toggle("sel", x === b);
       setLsbDetail(); // the tick note lives in the info line
@@ -7722,6 +7769,7 @@ function renderLsbRange() {
     b.dataset.r = key;
     b.textContent = label;
     b.onclick = () => {
+      if (lsb.busy) return;
       lsb.range = key;
       lsbApplyRange();
     };
@@ -7752,7 +7800,7 @@ function lsbApplyRange() {
   if (lsb.range) {
     const s = $("lsb-start"), e = $("lsb-end");
     if (lsb.range === "max") {
-      s.value = e.value = ""; // empty dates = the vault's full history
+      s.value = e.value = ""; // empty dates = the provider's available history
     } else {
       // Anchor to the selection's last data day when known, else today.
       const anchor = s.max ? new Date(s.max + "T00:00:00Z") : new Date();
@@ -7769,7 +7817,7 @@ function lsbApplyRange() {
 function setLsbDetail() {
   const info = $("lsb-info");
   const ready = lsbIsRef(lsb.dataset) || !!lsb.row;
-  $("lsb-go").disabled = !ready;
+  $("lsb-go").disabled = lsb.busy || !ready;
   if (lsbIsRef(lsb.dataset)) {
     info.textContent = lsbName(lsb.dataset) +
       ": the full reference table as one file.";
@@ -7782,24 +7830,40 @@ function setLsbDetail() {
       (lsb.dataset === "options"
         ? "\nOption pulls keep per-contract fidelity as Parquet files." : "") +
       (lsbIsCandle(lsb.dataset) && lsb.tf === "tick"
-        ? "\ntick: the raw ticks, saved as a Parquet file." : "");
+        ? "\ntick: the raw ticks, saved as a Parquet file." : "") +
+      (lsb.provider === "binance"
+        ? "\nSpot candles, quoted in " + (r.quote_asset || "the pair's quote asset") +
+          ". Max includes all available closed candles; coverage varies by pair." : "");
   } else {
-    info.textContent = "Pick an instrument to see its history span.";
+    info.textContent = lsb.provider === "binance"
+      ? "Pick a spot pair. Max downloads all available closed candles."
+      : "Pick an instrument to see its history span.";
   }
 }
 
-function lsbWatch(jobId) {
+function lsbWatch(jobId, provider) {
   clearInterval(lsb.timer);
+  const active = lsb.job = { jobId, provider };
+  lsbSetBusy(true);
   const st = $("lsb-status");
   st.classList.remove("hidden", "err");
-  st.textContent = "Export submitted; the vault is building your file";
+  st.textContent = provider === "binance" ? "Downloading Binance candles…"
+    : "Export submitted; the vault is building your file";
+  let polling = false;
   lsb.timer = setInterval(async () => {
+    if (polling || lsb.job !== active) return;
+    polling = true;
     let job;
     try {
-      const r = await fetch(`/api/lse/databank/import/${jobId}`);
-      if (!r.ok) return;
-      job = await r.json();
-    } catch (e) { return; }
+      const r = await fetch(`${lsbApi(provider)}/import/${encodeURIComponent(jobId)}`);
+      if (r.status === 404) job = { status: "failed", error: "Download job no longer exists. The server may have restarted; check your library before retrying." };
+      else if (!r.ok) throw new Error(await lsbResponseError(r));
+      else job = await r.json();
+    } catch (e) {
+      st.textContent = `Could not refresh download status: ${e.message}. Retrying…`;
+      return;
+    } finally { polling = false; }
+    if (lsb.job !== active) return;
     if (job.status === "exporting" || job.status === "importing") {
       const chunks = job.chunks_total ? `${job.chunks_done || 0}/${job.chunks_total} chunks · ` : "";
       const wait = job.retry_at ? Math.max(0, Math.ceil(job.retry_at - Date.now() / 1000)) : 0;
@@ -7807,17 +7871,19 @@ function lsbWatch(jobId) {
       return;
     }
     clearInterval(lsb.timer);
-    $("lsb-go").disabled = false;
+    lsb.timer = null;
+    lsb.job = null;
+    lsbSetBusy(false);
     if (job.status === "done") {
       st.textContent = `Imported ${job.entry.symbol}: ` +
         `${lsbFmtN(job.entry.rows)} rows` +
         (job.bytes ? ` (${lsbFmtB(job.bytes)} over the wire)` : "") + ".";
-      status(`imported ${job.entry.symbol} from LSE`);
+      status(`imported ${job.entry.symbol} from ${lsbProviderName(provider)}`);
       await refreshLibraryAll();
     } else if (job.status === "saved") {
       st.textContent = `Saved as a file: ${job.path}\n(Not chartable as ` +
         `candles/series, so it stays Parquet. Open it from MY DATA's folder.)`;
-      status("LSE download saved");
+      status(`${lsbProviderName(provider)} download saved`);
     } else {
       st.classList.add("err");
       st.textContent = "Import failed: " + (job.error || "unknown error");
@@ -7831,8 +7897,31 @@ function setupLsbModal() {
     if (e.target === $("lsb-modal")) $("lsb-modal").classList.add("hidden");
   };
   let deb;
+  $("lsb-provider").onchange = async () => {
+    if (lsb.busy) { $("lsb-provider").value = lsb.provider; return; }
+    clearTimeout(deb);
+    ++lsb.seq;
+    ++lsb.metaSeq;
+    lsb.provider = $("lsb-provider").value === "binance" ? "binance" : "lse";
+    lsb.meta = lsb.dataset = lsb.row = null;
+    lsb.ref = [];
+    lsb.usage = null;
+    lsb.range = "max";
+    $("lsb-search").value = "";
+    $("lsb-list").innerHTML = "";
+    $("lsb-status").classList.add("hidden");
+    $("lsb-folder").value = $("lsb-folder").placeholder = lsbProviderName();
+    renderLsbQuota();
+    await openLsbModal();
+  };
   $("lsb-search").oninput = () => {
     clearTimeout(deb);
+    // Invalidate and clear immediately: the debounce must not leave old results
+    // selectable under a new query, including a still-running catalog response.
+    ++lsb.seq;
+    lsb.row = null;
+    $("lsb-list").textContent = "Loading instruments…";
+    setLsbDetail();
     deb = setTimeout(lsbSearchNow, 180);
   };
   renderLsbRange();
@@ -7844,6 +7933,8 @@ function setupLsbModal() {
     for (const n of $("lsb-range").children) n.classList.remove("sel");
   };
   $("lsb-go").onclick = async () => {
+    if (lsb.busy || (!lsb.row && !lsbIsRef(lsb.dataset))) return;
+    const provider = lsb.provider;
     const body = {
       dataset: lsb.dataset,
       symbol: lsbIsRef(lsb.dataset) ? "" : (lsb.row && lsb.row.symbol) || "",
@@ -7851,22 +7942,25 @@ function setupLsbModal() {
       start: $("lsb-start").value, end: $("lsb-end").value,
       folder: $("lsb-folder").value.trim(),
     };
-    $("lsb-go").disabled = true;
-    const r = await fetch("/api/lse/databank/import", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) {
-      let detail = String(r.status);
-      try { detail = (await r.json()).detail || detail; } catch (e) { /* keep */ }
-      const st = $("lsb-status");
-      st.classList.remove("hidden");
+    ++lsb.seq;
+    lsbSetBusy(true);
+    const st = $("lsb-status");
+    st.classList.remove("hidden", "err");
+    st.textContent = "Submitting download…";
+    try {
+      const r = await fetch(`${lsbApi(provider)}/import`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(await lsbResponseError(r));
+      const d = await r.json();
+      if (!d.job_id) throw new Error("Server did not return a download job ID");
+      lsbWatch(d.job_id, provider);
+    } catch (e) {
       st.classList.add("err");
-      st.textContent = "Request failed: " + detail;
-      $("lsb-go").disabled = false;
-      return;
+      st.textContent = "Request failed: " + e.message;
+      lsbSetBusy(false);
     }
-    lsbWatch((await r.json()).job_id);
   };
 }
 

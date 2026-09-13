@@ -409,7 +409,8 @@ def import_csv(symbol: str, text: str, name: str = "", folder: str = "",
 
 
 def import_table(symbol: str, raw: pd.DataFrame, name: str = "",
-                 folder: str = "", kind: str = "", source_ext: str = ".csv") -> dict:
+                 folder: str = "", kind: str = "", source_ext: str = ".csv",
+                 source: str = "user-import", timeframe: str = "") -> dict:
     """Import an already-decoded table (any format). Same semantics as
     import_csv, minus the CSV parsing."""
     kind = kind or detect_kind_frame(raw)
@@ -417,7 +418,7 @@ def import_table(symbol: str, raw: pd.DataFrame, name: str = "",
     if kind == "ohlcv":
         df = normalize_frame(raw)
         df, repaired_dp = repair_float32_prices(df)
-        tf = infer_timeframe(df)
+        tf = timeframe or infer_timeframe(df)
         columns = []
     else:
         df = series_frame(raw)
@@ -446,7 +447,7 @@ def import_table(symbol: str, raw: pd.DataFrame, name: str = "",
         "first_ts": int(df["ts"].iloc[0]),
         "last_ts": int(df["ts"].iloc[-1]),
         "imported_at": int(time.time()),
-        "source": "user-import",
+        "source": source,
     }
     if repaired_dp is not None:
         entry["price_repair"] = {"decimals": repaired_dp,

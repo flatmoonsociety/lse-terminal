@@ -572,7 +572,7 @@ export default function QuantModels() {
               style={{ color: 'var(--dim)', borderLeft: '2px solid transparent' }}
             >
               <span style={{ width: 14, textAlign: 'center' }}>+</span>
-              Import via LSE Data
+              Import market data
             </button>
           </div>
         )}

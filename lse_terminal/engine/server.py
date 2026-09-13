@@ -397,6 +397,15 @@ class LseBankImportIn(BaseModel):
     folder: str = ""
 
 
+class BinanceImportIn(BaseModel):
+    dataset: str = "spot"
+    symbol: str = Field(min_length=1, max_length=40)
+    timeframe: str = "1h"
+    start: str = ""
+    end: str = ""
+    folder: str = "Binance"
+
+
 class _LocalOnlyGuard:
     """Reject browser cross-site and DNS-rebinding requests, engine-wide.
 
@@ -5501,6 +5510,89 @@ def create_app() -> FastAPI:
         if job is None:
             raise HTTPException(404, "no such import job")
         return job
+
+    # Binance public Spot history shares the library and job response format,
+    # but never needs an LSE key or uses the LSE export allowance.
+    from lse_terminal.providers import binance_import
+
+    binance_jobs: dict[str, dict] = {}
+    binance_jobs_lock = threading.Lock()
+
+    @app.get("/api/binance/databank")
+    def binance_overview():
+        return binance_import.overview()
+
+    @app.get("/api/binance/databank/catalog")
+    def binance_catalog(dataset: str = "spot", query: str = "", limit: int = 300):
+        if dataset != "spot":
+            raise HTTPException(400, "Binance supports Spot candles here")
+        try:
+            return binance_import.catalog(query=query, limit=max(1, min(limit, 400)))
+        except Exception as e:
+            raise HTTPException(502, f"Binance: {e}") from e
+
+    @app.post("/api/binance/databank/import")
+    def binance_start_import(body: BinanceImportIn):
+        deny_hosted()
+        import uuid as _uuid
+        from lse_terminal.providers import userdata
+
+        if body.dataset != "spot":
+            raise HTTPException(400, "Binance supports Spot candles here")
+        try:
+            symbol = binance_import._symbol(body.symbol)
+            timeframe = body.timeframe
+            if timeframe not in binance_import.TIMEFRAMES:
+                raise ValueError("unsupported Binance candle timeframe")
+            binance_import._bounds(body.start, body.end, int(time.time() * 1000))
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        folder = body.folder.strip()
+        request_key = (symbol, timeframe, body.start, body.end, folder)
+        with binance_jobs_lock:
+            for active in binance_jobs.values():
+                if active["status"] not in ("exporting", "importing"):
+                    continue
+                if active["request"] == request_key:
+                    return {"job_id": active["id"]}
+                if active["symbol"] == symbol and active["timeframe"] == timeframe:
+                    raise HTTPException(409, "This Binance symbol and timeframe are already downloading")
+            job_id = _uuid.uuid4().hex[:12]
+            job = {"id": job_id, "provider": "binance", "status": "exporting",
+                   "dataset": "spot", "symbol": symbol, "timeframe": timeframe,
+                   "request": request_key, "detail": "checking Binance Spot history"}
+            binance_jobs[job_id] = job
+
+        def run_binance():
+            try:
+                frame = binance_import.download(
+                    symbol, timeframe, body.start, body.end,
+                    cache_dir=userdata.data_dir() / "binance" / ".downloads",
+                    progress=lambda **fields: job.update(fields),
+                )
+                job.update(status="importing", detail="saving candles to the library")
+                with binance_jobs_lock:
+                    entry = userdata.import_table(
+                        f"BINANCE_SPOT_{symbol}_{timeframe.upper()}", frame,
+                        name=f"{symbol} · Binance Spot", folder=folder,
+                        source_ext=".csv", source="binance", timeframe=timeframe,
+                    )
+                job.update(status="done", entry=entry,
+                           detail=f"imported {entry['rows']} closed candles")
+            except Exception as e:
+                job.update(status="failed", error=str(e)[:500])
+
+        threading.Thread(target=run_binance, daemon=True,
+                         name=f"binance-databank-{job_id}").start()
+        return {"job_id": job_id}
+
+    @app.get("/api/binance/databank/import/{job_id}")
+    def binance_job(job_id: str):
+        with binance_jobs_lock:
+            job = binance_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(404, "no such Binance import job")
+            return dict(job)
 
     # ── Data Visualisation feeds ─────────────────────────────────────────────
     # The WORKSPACE > DATA VISUALISATION page charts arbitrary tables in the

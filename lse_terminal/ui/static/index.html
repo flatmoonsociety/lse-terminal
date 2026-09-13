@@ -453,22 +453,20 @@ def my_ind(df, length=20):
       </div>
     </div>
   </div>
-  <!-- LSE databank import (library toolbar > LSE): browse the databank catalog,
-       pick an instrument or dataset, and pull its history straight into the
-       library. The engine downloads server-built Parquet via your LSE key. -->
-  <div id="lsb-modal" class="hidden">
+  <!-- Provider imports share the catalog picker and library download flow. -->
+  <div id="lsb-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="lsb-title">
     <div id="lsb-card">
-      <div id="lsb-head"><span>Import from LSE</span>
+      <div id="lsb-head"><span id="lsb-title">Import market data</span>
         <button id="lsb-close" title="Close">&times;</button></div>
-      <p class="src-help">Your LSE key unlocks the databank: the full recorded
-      history behind the platform. Pick anything below and it downloads into
-      your library as compressed Parquet, ready to chart and backtest.</p>
-      <div id="lsb-key-hint" class="hidden">No LSE API key set. Add your free
-        key under <b>MARKETS</b> first; the databank uses the same key.</div>
+      <label id="lsb-provider-wrap">Provider
+        <select id="lsb-provider"><option value="lse">LSE Data</option><option value="binance">Binance (Spot)</option></select>
+      </label>
+      <p id="lsb-help" class="src-help"></p>
+      <div id="lsb-key-hint" class="hidden" role="status"></div>
       <div id="lsb-body" class="hidden">
         <div id="lsb-sets"></div>
         <div id="lsb-mid">
-          <input id="lsb-search" placeholder="Search symbol or name" spellcheck="false">
+          <input id="lsb-search" aria-label="Search symbol or name" placeholder="Search symbol or name" spellcheck="false">
           <div id="lsb-list"></div>
         </div>
         <div id="lsb-side">
@@ -483,7 +481,7 @@ def my_ind(df, length=20):
           <label>Library folder <input id="lsb-folder" list="lsb-folders" placeholder="LSE" spellcheck="false">
             <datalist id="lsb-folders"></datalist></label>
           <button id="lsb-go" disabled>Download to library</button>
-          <div id="lsb-status" class="hidden"></div>
+          <div id="lsb-status" class="hidden" role="status" aria-live="polite"></div>
           <div id="lsb-quota" class="md-help"></div>
         </div>
       </div>
