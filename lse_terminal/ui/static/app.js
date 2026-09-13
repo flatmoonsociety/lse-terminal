@@ -7490,7 +7490,8 @@ function showMdError(msg) {
    only the picker plus a job status line. */
 
 const lsb = { provider: "lse", meta: null, ref: [], usage: null, dataset: null, row: null,
-              timer: null, seq: 0, metaSeq: 0, tf: "1h", range: "max", busy: false, job: null };
+              timer: null, seq: 0, metaSeq: 0, tf: "1h", range: "max", busy: false, job: null,
+              coverage: null, coverageSeq: 0, coverageLoading: false, coverageError: "" };
 const lsbApi = (provider = lsb.provider) => `/api/${provider}/databank`;
 const lsbProviderName = (provider = lsb.provider) => provider === "binance" ? "Binance" : "LSE";
 
@@ -7506,6 +7507,7 @@ const LSB_NAMES = {
   fx: "Forex", etf: "ETFs", index: "Indices", commodity: "Commodities",
   cot: "COT positioning", economics: "Economics",
   currency_index: "Currency index", fx_derivatives: "FX derivatives", spot: "Spot crypto",
+  usdm: "USD-M Futures", coinm: "COIN-M Futures",
 };
 const lsbName = (id) => LSB_NAMES[id] ||
   (id.charAt(0).toUpperCase() + id.slice(1)).replace(/_/g, " ");
@@ -7525,7 +7527,7 @@ async function openLsbModal() {
   $("lsb-modal").classList.remove("hidden");
   $("lsb-provider").value = lsb.provider;
   $("lsb-help").textContent = lsb.provider === "binance"
-    ? "Download Binance Spot candles through its public API; no API key needed. Dates are UTC. Max downloads all available closed candles into your library."
+    ? "Download Binance Spot or Futures candles through its public API; no API key needed. Pick an instrument to check its available history. Dates are UTC."
     : "Your LSE key unlocks the databank's recorded history. Candles and series go into your library; raw exports stay as Parquet files.";
   if (lsb.busy) return; // Closing the picker never interrupts or forgets an import.
   if (!lsb.meta) {
@@ -7628,6 +7630,7 @@ function lsbPickSet(ds) {
   ++lsb.seq;
   lsb.dataset = ds;
   lsb.row = null;
+  lsbClearCoverage();
   for (const n of document.querySelectorAll(".lsb-set"))
     n.classList.toggle("sel", n.dataset.ds === ds);
   $("lsb-search").value = "";
@@ -7693,6 +7696,7 @@ async function lsbSearchNow() {
     if (seq === lsb.seq) {
       el.textContent = `Could not load instruments: ${e.message}`;
       lsb.row = null;
+      lsbClearCoverage();
       setLsbDetail();
     }
     return;
@@ -7720,6 +7724,7 @@ async function lsbSearchNow() {
     n.onclick = () => {
       if (lsb.busy) return;
       lsb.row = row;
+      lsbClearCoverage();
       for (const x of el.children) x.classList.toggle("sel", x === n);
       // Re-anchor the date presets to THIS instrument's coverage: "30d" means
       // its last recorded month, not the calendar's, so stale symbols still
@@ -7727,6 +7732,7 @@ async function lsbSearchNow() {
       lsbApplyBounds();
       lsbApplyRange();
       setLsbDetail();
+      if (lsb.provider === "binance") lsbLoadCoverage();
     };
     el.appendChild(n);
   }
@@ -7754,6 +7760,7 @@ function renderLsbTf(tfs) {
       lsb.tf = t;
       for (const x of el.children) x.classList.toggle("sel", x === b);
       setLsbDetail(); // the tick note lives in the info line
+      if (lsb.provider === "binance" && lsb.row) lsbLoadCoverage();
     };
     el.appendChild(b);
   }
@@ -7772,6 +7779,7 @@ function renderLsbRange() {
       if (lsb.busy) return;
       lsb.range = key;
       lsbApplyRange();
+      setLsbDetail();
     };
     el.appendChild(b);
   }
@@ -7788,8 +7796,9 @@ function lsbApplyBounds() {
     first = m ? m.first : "";
     last = m ? m.last : "";
   } else if (lsb.row) {
-    first = lsb.row.first_tick;
-    last = lsb.row.last_tick;
+    const coverage = lsb.provider === "binance" ? lsb.coverage : lsb.row;
+    first = coverage?.first_tick;
+    last = coverage?.last_tick;
   }
   const cut = (v) => (v ? String(v).slice(0, 10) : "");
   s.min = e.min = cut(first);
@@ -7806,7 +7815,8 @@ function lsbApplyRange() {
       const anchor = s.max ? new Date(s.max + "T00:00:00Z") : new Date();
       const from = new Date(anchor.getTime() -
         LSB_RANGE_DAYS[lsb.range] * 86400000);
-      s.value = from.toISOString().slice(0, 10);
+      const day = from.toISOString().slice(0, 10);
+      s.value = s.min && day < s.min ? s.min : day;
       e.value = ""; // open end = through the latest recorded day
     }
   }
@@ -7814,15 +7824,86 @@ function lsbApplyRange() {
     n.classList.toggle("sel", n.dataset.r === lsb.range);
 }
 
+function lsbClearCoverage() {
+  ++lsb.coverageSeq;
+  lsb.coverage = null;
+  lsb.coverageLoading = false;
+  lsb.coverageError = "";
+  lsbApplyBounds();
+}
+
+async function lsbLoadCoverage() {
+  if (lsb.busy || lsb.provider !== "binance" || !lsb.row) return;
+  lsbClearCoverage();
+  const seq = lsb.coverageSeq;
+  lsb.coverageLoading = true;
+  setLsbDetail();
+  try {
+    const r = await fetch(`${lsbApi()}/metadata?dataset=${encodeURIComponent(lsb.dataset)}` +
+      `&symbol=${encodeURIComponent(lsb.row.symbol)}&timeframe=${encodeURIComponent(lsb.tf)}`);
+    if (!r.ok) throw new Error(await lsbResponseError(r));
+    const coverage = await r.json();
+    if (seq !== lsb.coverageSeq) return;
+    lsb.coverage = coverage;
+    lsbApplyBounds();
+    lsbApplyRange(); // Custom dates remain untouched, including edits made while loading.
+  } catch (e) {
+    if (seq !== lsb.coverageSeq) return;
+    lsb.coverageError = e.message;
+  }
+  if (seq !== lsb.coverageSeq) return;
+  lsb.coverageLoading = false;
+  setLsbDetail();
+}
+
+function lsbCoverageDetail() {
+  if (lsb.coverageLoading) return `Checking available ${lsb.tf} history…`;
+  if (lsb.coverageError) return `History check failed: ${lsb.coverageError}. Retry the check or download with your chosen dates.`;
+  const c = lsb.coverage;
+  if (!c) return "";
+  if (!c.first_tick || !c.last_tick) return `No closed ${lsb.tf} candles are available for this instrument.`;
+  const utc = value => String(value).replace("T", " ").slice(0, 16) + " UTC";
+  const first = Date.parse(c.first_tick), last = Date.parse(c.last_tick);
+  const days = Math.max(1, Math.floor((last - first) / 86400000) + 1);
+  let text = `Available ${lsb.tf} history:\n${utc(c.first_tick)} →\n${utc(c.last_tick)}\n` +
+    `${days.toLocaleString()} days` + (days >= 365 ? ` (${(days / 365.25).toFixed(1)} years)` : "") +
+    (c.estimated_bars != null ? ` · approximately ${Number(c.estimated_bars).toLocaleString()} candles` : "") +
+    ".\nGaps may reduce actual candle counts.";
+  const start = $("lsb-start").value, end = $("lsb-end").value;
+  const step = ({ "1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800 })[lsb.tf] * 1000;
+  if ((start || end) && step) {
+    const from = start ? Math.max(first, Date.parse(start + "T00:00:00Z")) : first;
+    const to = end ? Math.min(last, Date.parse(end + "T00:00:00Z") + 86400000 - 1) : last;
+    const count = Math.max(0, Math.floor((to - first) / step) - Math.ceil((from - first) / step) + 1);
+    text += `\nSelected dates: approximately ${count.toLocaleString()} candles.`;
+  }
+  return text;
+}
+
 function setLsbDetail() {
   const info = $("lsb-info");
   const ready = lsbIsRef(lsb.dataset) || !!lsb.row;
-  $("lsb-go").disabled = lsb.busy || !ready;
+  const noHistory = lsb.provider === "binance" && lsb.coverage && (!lsb.coverage.first_tick || !lsb.coverage.last_tick);
+  $("lsb-go").disabled = lsb.busy || !ready || lsb.coverageLoading || !!noHistory;
+  $("lsb-history-retry").classList.toggle("hidden", !lsb.coverageError || lsb.provider !== "binance");
+  $("lsb-history-retry").disabled = lsb.busy;
   if (lsbIsRef(lsb.dataset)) {
     info.textContent = lsbName(lsb.dataset) +
       ": the full reference table as one file.";
   } else if (lsb.row) {
     const r = lsb.row;
+    if (lsb.provider === "binance") {
+      const volume = r.volume_unit === "contracts" || lsb.dataset === "coinm"
+        ? "contracts" : r.base_asset || "the base asset";
+      const market = lsb.dataset === "spot" ? `Spot candles, quoted in ${r.quote_asset || "the pair's quote asset"}.`
+        : `${lsbName(lsb.dataset)} · ${(r.contract_type || "").replace(/_/g, " ").toLowerCase()}\n` +
+          `Quoted in ${r.quote_asset || "the quote asset"}; settled in ${r.margin_asset || "the margin asset"}.` +
+          (lsb.dataset === "coinm" && r.contract_size ? ` Contract size: ${r.contract_size} ${r.quote_asset}.` : "");
+      const accounting = lsb.dataset === "spot" ? "" : "\n\nFunding or margin liquidation are not simulated." +
+        (lsb.dataset === "coinm" ? " COIN-M is inverse; ordinary price-based backtests do not reproduce coin-denominated P&L." : "");
+      info.textContent = `${r.symbol}\n${market} Volume in ${volume}.\n\n${lsbCoverageDetail()}${accounting}`;
+      return;
+    }
     info.textContent = `${r.symbol}  ${r.name || ""}\n` +
       (r.ticks ? `${lsbFmtN(r.ticks)} ticks` : "") +
       (r.first_tick ? `, ${String(r.first_tick).slice(0, 10)} to ` +
@@ -7830,13 +7911,10 @@ function setLsbDetail() {
       (lsb.dataset === "options"
         ? "\nOption pulls keep per-contract fidelity as Parquet files." : "") +
       (lsbIsCandle(lsb.dataset) && lsb.tf === "tick"
-        ? "\ntick: the raw ticks, saved as a Parquet file." : "") +
-      (lsb.provider === "binance"
-        ? "\nSpot candles, quoted in " + (r.quote_asset || "the pair's quote asset") +
-          ". Max includes all available closed candles; coverage varies by pair." : "");
+        ? "\ntick: the raw ticks, saved as a Parquet file." : "");
   } else {
     info.textContent = lsb.provider === "binance"
-      ? "Pick a spot pair. Max downloads all available closed candles."
+      ? "Pick an instrument to see its available history and estimated candle count. Max downloads all available closed candles."
       : "Pick an instrument to see its history span.";
   }
 }
@@ -7904,6 +7982,7 @@ function setupLsbModal() {
     ++lsb.metaSeq;
     lsb.provider = $("lsb-provider").value === "binance" ? "binance" : "lse";
     lsb.meta = lsb.dataset = lsb.row = null;
+    lsbClearCoverage();
     lsb.ref = [];
     lsb.usage = null;
     lsb.range = "max";
@@ -7920,6 +7999,7 @@ function setupLsbModal() {
     // selectable under a new query, including a still-running catalog response.
     ++lsb.seq;
     lsb.row = null;
+    lsbClearCoverage();
     $("lsb-list").textContent = "Loading instruments…";
     setLsbDetail();
     deb = setTimeout(lsbSearchNow, 180);
@@ -7931,9 +8011,11 @@ function setupLsbModal() {
   $("lsb-start").oninput = $("lsb-end").oninput = () => {
     lsb.range = null;
     for (const n of $("lsb-range").children) n.classList.remove("sel");
+    setLsbDetail();
   };
+  $("lsb-history-retry").onclick = lsbLoadCoverage;
   $("lsb-go").onclick = async () => {
-    if (lsb.busy || (!lsb.row && !lsbIsRef(lsb.dataset))) return;
+    if ($("lsb-go").disabled) return;
     const provider = lsb.provider;
     const body = {
       dataset: lsb.dataset,

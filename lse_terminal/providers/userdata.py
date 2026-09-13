@@ -410,7 +410,8 @@ def import_csv(symbol: str, text: str, name: str = "", folder: str = "",
 
 def import_table(symbol: str, raw: pd.DataFrame, name: str = "",
                  folder: str = "", kind: str = "", source_ext: str = ".csv",
-                 source: str = "user-import", timeframe: str = "") -> dict:
+                 source: str = "user-import", timeframe: str = "",
+                 instrument: dict | None = None) -> dict:
     """Import an already-decoded table (any format). Same semantics as
     import_csv, minus the CSV parsing."""
     kind = kind or detect_kind_frame(raw)
@@ -449,6 +450,8 @@ def import_table(symbol: str, raw: pd.DataFrame, name: str = "",
         "imported_at": int(time.time()),
         "source": source,
     }
+    if instrument is not None:
+        entry["instrument"] = dict(instrument)
     if repaired_dp is not None:
         entry["price_repair"] = {"decimals": repaired_dp,
                                  "reason": "float32 artifacts detected"}

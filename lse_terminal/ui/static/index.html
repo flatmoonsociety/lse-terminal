@@ -459,7 +459,7 @@ def my_ind(df, length=20):
       <div id="lsb-head"><span id="lsb-title">Import market data</span>
         <button id="lsb-close" title="Close">&times;</button></div>
       <label id="lsb-provider-wrap">Provider
-        <select id="lsb-provider"><option value="lse">LSE Data</option><option value="binance">Binance (Spot)</option></select>
+        <select id="lsb-provider"><option value="lse">LSE Data</option><option value="binance">Binance</option></select>
       </label>
       <p id="lsb-help" class="src-help"></p>
       <div id="lsb-key-hint" class="hidden" role="status"></div>
@@ -470,7 +470,8 @@ def my_ind(df, length=20):
           <div id="lsb-list"></div>
         </div>
         <div id="lsb-side">
-          <div id="lsb-info" class="md-help">Pick a dataset on the left, then an instrument.</div>
+          <div id="lsb-info" class="md-help" role="status" aria-live="polite">Pick a dataset on the left, then an instrument.</div>
+          <button id="lsb-history-retry" class="hidden" type="button">Retry history check</button>
           <!-- Presets over pickers: timeframe and range
                are one-click chip rows; the date inputs stay as the custom
                escape hatch and are auto-filled by the Range chips. -->

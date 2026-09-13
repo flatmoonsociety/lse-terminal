@@ -23,7 +23,7 @@ class Market:
         self.now = now if now is not None else rows[-1][6] + 1
         self.calls = []
 
-    def __call__(self, path, params=None, progress=lambda **_: None):
+    def __call__(self, path, params=None, progress=lambda **_: None, dataset="spot"):
         self.calls.append((path, params))
         if path == "time":
             return {"serverTime": self.now}
@@ -52,7 +52,7 @@ def test_download_pages_all_history_in_one_resumable_file(tmp_path, monkeypatch)
 
 def test_interrupted_import_reuses_committed_pages_then_extends_closed_tail(tmp_path, monkeypatch):
     market = Market(candles(2200))
-    def interrupted(path, params=None, progress=lambda **_: None):
+    def interrupted(path, params=None, progress=lambda **_: None, dataset="spot"):
         if path == "klines" and params.get("startTime") == FIRST + 1000 * 60000:
             raise b.BinanceError("connection stopped")
         return market(path, params, progress)
@@ -124,7 +124,7 @@ def test_rejects_corrupt_pages_before_checkpoint_commit(tmp_path, monkeypatch, c
                          "high": (2, "90"), "timestamp": (0, "bad"),
                          "duration": (6, FIRST + 600_000)}[change]
         rows[1][column] = value
-    def request(path, params=None, progress=lambda **_: None):
+    def request(path, params=None, progress=lambda **_: None, dataset="spot"):
         return {"serverTime": FIRST + 300_000} if path == "time" else rows
     monkeypatch.setattr(b, "_request", request)
     with pytest.raises(b.BinanceError, match="invalid, unordered or duplicate"):
@@ -135,7 +135,7 @@ def test_rejects_corrupt_pages_before_checkpoint_commit(tmp_path, monkeypatch, c
 
 def test_empty_or_truncated_pages_never_return_success(tmp_path, monkeypatch):
     market = Market(candles(1500))
-    def truncated(path, params=None, progress=lambda **_: None):
+    def truncated(path, params=None, progress=lambda **_: None, dataset="spot"):
         if path == "klines" and params.get("startTime") == FIRST + 1000 * 60000:
             return []
         return market(path, params, progress)
@@ -170,7 +170,7 @@ class Response(io.BytesIO):
 @pytest.fixture
 def transport(monkeypatch):
     events, sleeps, calls = [], [], []
-    monkeypatch.setattr(b, "_NEXT_REQUEST", 0)
+    monkeypatch.setattr(b, "_NEXT_REQUEST", dict.fromkeys(b.MARKET_NAMES, 0))
     monkeypatch.setattr(b, "_pause", lambda progress, detail, seconds: sleeps.append(seconds))
     def send(request, timeout):
         calls.append(request)
@@ -221,7 +221,7 @@ def test_transient_retries_are_bounded_and_invalid_symbol_is_not_retried(transpo
 
 def test_quota_response_headers_trigger_wait_before_next_request(transport, monkeypatch):
     events, sleeps, calls = transport
-    monkeypatch.setattr(b, "_WEIGHT_LIMITS", {60: 100})
+    monkeypatch.setattr(b, "_WEIGHT_LIMITS", {market: {60: 100} for market in b.MARKET_NAMES})
     events.extend([Response({}, {"X-MBX-USED-WEIGHT-1M": "95"}), Response({})])
     b._request("time")
     b._request("time")
@@ -231,7 +231,7 @@ def test_quota_response_headers_trigger_wait_before_next_request(transport, monk
 def test_catalog_uses_public_spot_info_and_metadata_closed_edges(monkeypatch):
     market = Market(candles(3), now=FIRST + 150_000)
     calls = []
-    def request(path, params=None, progress=lambda **_: None):
+    def request(path, params=None, progress=lambda **_: None, dataset="spot"):
         calls.append((path, params))
         if path == "exchangeInfo":
             assert params == {"permissions": "SPOT", "showPermissionSets": "false"}
@@ -242,8 +242,9 @@ def test_catalog_uses_public_spot_info_and_metadata_closed_edges(monkeypatch):
                     "rateLimits": [{"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE",
                                     "intervalNum": 1, "limit": 6000}]}
         return market(path, params, progress)
-    monkeypatch.setattr(b, "_EXCHANGE_CACHE", None)
-    monkeypatch.setattr(b, "_WEIGHT_LIMITS", {60: 6000})
+    monkeypatch.setattr(b, "_EXCHANGE_CACHE", {})
+    monkeypatch.setattr(b, "_METADATA_CACHE", {})
+    monkeypatch.setattr(b, "_WEIGHT_LIMITS", {market: {60: 6000} for market in b.MARKET_NAMES})
     monkeypatch.setattr(b, "_request", request)
     assert [r["symbol"] for r in b.catalog("BTC")["rows"]] == ["BTCUSDT", "BTCEUR", "ETHBTC"]
     meta = b.metadata("BTCUSDT")
@@ -251,3 +252,157 @@ def test_catalog_uses_public_spot_info_and_metadata_closed_edges(monkeypatch):
     assert meta["last_tick"] == "2024-01-01T00:01:00+00:00"
     assert meta["timeframes"] == list(b.TIMEFRAMES)
     assert len([c for c in calls if c[0] == "exchangeInfo"]) == 1
+
+
+class FuturesMarket:
+    """Model COIN-M's documented latest-N behavior, unlike Spot's forward pages."""
+    def __init__(self, rows, *, now=None, delivery=None, reverse_limit=True):
+        self.rows = rows
+        self.now = now or rows[-1][6] + 1
+        self.delivery = delivery or 4133404800000
+        self.reverse_limit = reverse_limit
+        self.calls = []
+
+    def __call__(self, path, params=None, progress=lambda **_: None, dataset="spot"):
+        self.calls.append((dataset, path, params))
+        if path == "time":
+            return {"serverTime": self.now}
+        if path == "exchangeInfo":
+            assert params is None if dataset != "spot" else params["permissions"] == "SPOT"
+            symbol = "BTCUSD_PERP" if dataset == "coinm" else "BTCUSDT"
+            return {"symbols": [{"symbol": symbol, "baseAsset": "BTC", "quoteAsset": "USD" if dataset == "coinm" else "USDT",
+                                 "marginAsset": "BTC" if dataset == "coinm" else "USDT", "contractType": "PERPETUAL",
+                                 "contractSize": 100 if dataset == "coinm" else None,
+                                 "onboardDate": FIRST + 60000, "deliveryDate": self.delivery,
+                                 "contractStatus": "TRADING" if dataset == "coinm" else "SETTLING"}],
+                    "rateLimits": [{"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE", "intervalNum": 1, "limit": 2400}]}
+        assert path == "klines"
+        if dataset == "coinm" and "startTime" in params:
+            assert params["endTime"] - params["startTime"] < 200 * b._DAY
+        rows = self.rows
+        if params["interval"] == "1d" and rows and rows[0][6] - rows[0][0] < b._DAY - 1:
+            # Daily discovery sees a forming day as well as completed days.
+            rows = [candles(1, first=day, step=b._DAY)[0] for day in sorted({r[0] // b._DAY * b._DAY for r in rows})]
+        rows = [r for r in rows if params.get("startTime", 0) <= r[0] <= params.get("endTime", self.now)]
+        backwards = "startTime" not in params or (dataset == "coinm" and self.reverse_limit)
+        return rows[-params["limit"]:] if backwards else rows[:params["limit"]]
+
+
+@pytest.fixture
+def market_cache(monkeypatch):
+    monkeypatch.setattr(b, "_EXCHANGE_CACHE", {})
+    monkeypatch.setattr(b, "_EXCHANGE_AT", {})
+    monkeypatch.setattr(b, "_METADATA_CACHE", {})
+    monkeypatch.setattr(b, "_WEIGHT_LIMITS", {market: {60: 6000} for market in b.MARKET_NAMES})
+
+
+@pytest.mark.parametrize("dataset,symbol", [("usdm", "BTCUSDT"), ("coinm", "BTCUSD_PERP")])
+def test_futures_pages_start_at_first_bar_and_preserve_native_volume(tmp_path, monkeypatch, market_cache, dataset, symbol):
+    market = FuturesMarket(candles(2501))
+    monkeypatch.setattr(b, "_request", market)
+    frame = b.download(symbol, "1m", "", "", tmp_path, dataset=dataset)
+    assert len(frame) == 2501
+    assert frame.ts.iloc[0] == pd.Timestamp(FIRST, unit="ms", tz="UTC")
+    assert frame.ts.iloc[-1] == pd.Timestamp(FIRST + 2500 * 60000, unit="ms", tz="UTC")
+    assert frame.volume.sum() == 2501 * 5.5
+    pd.testing.assert_frame_equal(frame, b.download(symbol, "1m", "", "", tmp_path, dataset=dataset))
+    assert {c[0] for c in market.calls} == {dataset}
+
+
+@pytest.mark.parametrize("reverse_limit", [False, True])
+def test_coinm_daily_full_history_crosses_200_day_windows(tmp_path, monkeypatch, market_cache, reverse_limit):
+    market = FuturesMarket(candles(821, step=b._DAY), reverse_limit=reverse_limit)
+    monkeypatch.setattr(b, "_request", market)
+    frame = b.download("BTCUSD_PERP", "1d", "", "", tmp_path, dataset="coinm")
+    assert len(frame) == 821  # No lost beginning even when each response returns the last N.
+    assert frame.ts.iloc[0] == pd.Timestamp("2024-01-01", tz="UTC")
+    assert frame.ts.iloc[-1] == pd.Timestamp(FIRST + 820 * b._DAY, unit="ms", tz="UTC")
+
+
+def test_futures_empty_windows_do_not_drop_later_real_history(tmp_path, monkeypatch, market_cache):
+    market = FuturesMarket(candles(2) + candles(2, first=FIRST + 2002 * 60000))
+    monkeypatch.setattr(b, "_request", market)
+    frame = b.download("BTCUSD_PERP", "1m", "", "", tmp_path, dataset="coinm")
+    assert len(frame) == 4 and frame.volume.sum() == 22
+    assert list(frame.ts.dt.as_unit("ms").astype("int64")) == [r[0] for r in market.rows]
+
+
+def test_settled_contract_metadata_and_download_stop_at_delivery(tmp_path, monkeypatch, market_cache):
+    # The real USD-M API keeps returning synthetic-looking zero-volume bars
+    # after SETTLING; do not advertise or import past the contract's lifetime.
+    market = FuturesMarket(candles(10), delivery=FIRST + 3 * 60000)
+    monkeypatch.setattr(b, "_request", market)
+    meta = b.metadata("BTCUSDT", dataset="usdm", timeframe="1m")
+    assert meta["first_tick"] == "2024-01-01T00:00:00+00:00"  # Before reported onboardDate.
+    assert meta["last_tick"] == "2024-01-01T00:02:00+00:00"
+    assert meta["estimated_bars"] == 3 and meta["available_history"] is True
+    assert meta["volume_unit"] == "base asset" and meta["status"] == "SETTLING"
+    frame = b.download("BTCUSDT", "1m", "", "", tmp_path, dataset="usdm")
+    assert len(frame) == 3
+    with pytest.raises(ValueError, match="already expired"):
+        b.download("BTCUSDT", "1m", "2024-01-01T00:05:00Z", "", tmp_path, dataset="usdm")
+
+
+def test_available_span_estimate_is_interval_specific_cached_and_not_an_exact_count(monkeypatch, market_cache):
+    market = FuturesMarket(candles(2) + candles(1, first=FIRST + 5 * 60000), now=FIRST + 5 * 60000 + 30000)
+    monkeypatch.setattr(b, "_request", market)
+    meta = b.metadata("BTCUSD_PERP", dataset="coinm", timeframe="1m")
+    assert meta["estimated_bars"] == 2  # Excludes the still-open final minute.
+    assert meta["days"] == 2 / 1440 and meta["years"] == 2 / (1440 * 365.25)
+    assert "Estimate" in meta["estimate_note"]
+    assert meta["contract_size"] == 100 and meta["volume_unit"] == "contracts"
+    calls = len(market.calls)
+    assert meta == b.metadata("BTCUSD_PERP", dataset="coinm", timeframe="1m")
+    assert len(market.calls) == calls
+    market.now += 30000
+    b._METADATA_CACHE.clear()
+    assert b.metadata("BTCUSD_PERP", dataset="coinm", timeframe="1m")["estimated_bars"] == 6  # Three actual bars; gaps not filled.
+    day = b.metadata("BTCUSD_PERP", dataset="coinm", timeframe="1d")
+    assert day["timeframe"] == "1d" and day["estimated_bars"] == 0
+    assert day["first_tick"] is None and not day["available_history"]
+
+
+def test_market_catalog_cache_and_checkpoint_identity_are_separate(tmp_path, monkeypatch, market_cache):
+    market = FuturesMarket(candles(3))
+    monkeypatch.setattr(b, "_request", market)
+    for dataset in ("spot", "usdm"):
+        b.catalog("BTC", dataset=dataset)
+        b.download("BTCUSDT", "1m", "", "", tmp_path, dataset=dataset)
+    assert len(list(tmp_path.glob("*.sqlite3"))) == 2
+    assert set(b._EXCHANGE_CACHE) == {"spot", "usdm"}
+    assert {c[0] for c in market.calls if c[1] == "exchangeInfo"} == {"spot", "usdm"}
+
+
+def test_market_throttle_and_endpoints_are_independent(transport):
+    events, sleeps, calls = transport
+    events.extend([error(418, 3600), Response({"serverTime": FIRST}), Response({"serverTime": FIRST})])
+    with pytest.raises(b.BinanceError, match="Download progress is saved"):
+        b._request("time", dataset="coinm")
+    assert b._request("time", dataset="usdm")["serverTime"] == FIRST
+    assert b._request("time", dataset="spot")["serverTime"] == FIRST
+    assert [c.full_url for c in calls] == ["https://dapi.binance.com/dapi/v1/time",
+                                           "https://fapi.binance.com/fapi/v1/time",
+                                           "https://data-api.binance.vision/api/v3/time"]
+    assert sleeps == []
+
+
+def test_dataset_and_contract_symbol_validation(monkeypatch, tmp_path):
+    assert b._symbol("btcusd_260925") == "BTCUSD_260925"
+    assert b._symbol("BTCUSD_PERP") == "BTCUSD_PERP"
+    assert b._symbol("币安人生USDT") == "币安人生USDT"
+    for symbol in ("BTC/USD", "..", "BTC-USDT", "_BTC", "BTC%3F", "BTC USDT", "BTC\u200bUSDT"):
+        with pytest.raises(ValueError):
+            b._symbol(symbol)
+    for action in (lambda: b.catalog(dataset="futures"), lambda: b.metadata("BTCUSDT", dataset="../spot"),
+                   lambda: b.download("BTCUSDT", "1m", "", "", tmp_path, dataset="wrong")):
+        with pytest.raises(ValueError, match="market"):
+            action()
+    assert not list(tmp_path.iterdir())
+
+
+
+def test_coinm_custom_start_after_first_days_bars_finds_later_history(tmp_path, monkeypatch, market_cache):
+    market = FuturesMarket(candles(2) + candles(2, first=FIRST + 3 * b._DAY))
+    monkeypatch.setattr(b, "_request", market)
+    frame = b.download("BTCUSD_PERP", "1m", "2024-01-01T23:00:00Z", "", tmp_path, dataset="coinm")
+    assert len(frame) == 2 and frame.ts.iloc[0] == pd.Timestamp("2024-01-04", tz="UTC")

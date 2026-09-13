@@ -708,7 +708,7 @@ html:not(.dark) #inq-actions button:hover { background: #cfd3d9; border-color: #
 }
 #lsb-modal.hidden { display: none; }
 #lsb-card {
-  width: min(860px, 94vw); height: min(560px, 88vh); display: flex;
+  width: min(1020px, 94vw); height: min(760px, 88vh); display: flex;
   flex-direction: column; background: var(--panel);
   border: 1px solid var(--edge); border-radius: 3px; padding: 12px 14px;
 }
@@ -747,7 +747,7 @@ html:not(.dark) #inq-actions button:hover { background: #cfd3d9; border-color: #
 .lsb-row .sym { font-family: var(--mono); flex: none; }
 .lsb-row .nm { color: var(--dim); overflow: hidden; text-overflow: ellipsis; flex: 1; }
 .lsb-row .span { color: var(--dim); font-size: 10.5px; flex: none; }
-#lsb-side { width: 218px; flex: none; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+#lsb-side { width: clamp(260px, 30vw, 320px); flex: none; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
 #lsb-side label, #lsb-side .lsb-field { display: flex; flex-direction: column; gap: 3px;
   color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
 #lsb-side input, #lsb-side select { font-size: 13px; }
@@ -760,7 +760,9 @@ html:not(.dark) #inq-actions button:hover { background: #cfd3d9; border-color: #
   border-color: transparent; border-radius: 2px; font-variant-numeric: tabular-nums; }
 .lsb-chip:hover { color: var(--text); }
 .lsb-chip.sel { color: var(--text); background: var(--edge); }
-#lsb-info { font-size: 12px; line-height: 1.5; }
+#lsb-info { font-size: 12px; line-height: 1.5; white-space: pre-line; overflow-wrap: anywhere; }
+#lsb-history-retry { font-size: 12px; }
+#lsb-history-retry.hidden { display: none; }
 #lsb-go { padding: 7px 4px; background: var(--raise); border: 1px solid var(--raise-h);
   border-radius: 2px; color: var(--text); font-size: 12.5px; }
 #lsb-go:hover:not(:disabled) { background: var(--raise-h); }

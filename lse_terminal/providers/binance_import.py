@@ -1,6 +1,9 @@
-"""Public Binance Spot candles, paginated into a resumable local checkpoint.
+"""Public Binance Spot, USD-M and COIN-M candles in resumable checkpoints.
 
-API contract: https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md
+API contracts:
+https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md
+https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Kline-Candlestick-Data
+https://developers.binance.com/docs/derivatives/coin-margined-futures/market-data/Kline-Candlestick-Data
 No credentials, trading endpoints, synthetic candles, or total-history row cap.
 """
 
@@ -23,7 +26,12 @@ from urllib.request import Request, urlopen
 import numpy as np
 import pandas as pd
 
-BASE_URL = "https://data-api.binance.vision"
+MARKET_NAMES = {"spot": "Spot", "usdm": "USD-M Futures", "coinm": "COIN-M Futures"}
+_URLS = {"spot": "https://data-api.binance.vision/api/v3/",
+         "usdm": "https://fapi.binance.com/fapi/v1/",
+         "coinm": "https://dapi.binance.com/dapi/v1/"}
+_DAY = 86_400_000
+_MAX_FUTURES_WINDOW = 200 * _DAY
 TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 _MILLISECONDS = dict(zip(TIMEFRAMES, (60_000, 300_000, 900_000, 1_800_000,
                                     3_600_000, 14_400_000, 86_400_000, 604_800_000)))
@@ -31,10 +39,11 @@ _MILLISECONDS = dict(zip(TIMEFRAMES, (60_000, 300_000, 900_000, 1_800_000,
 # until concurrent download throughput matters; Binance quotas are shared by IP.
 _REQUEST_LOCK = threading.Lock()
 _DOWNLOAD_LOCK = threading.Lock()
-_NEXT_REQUEST = 0.0
-_WEIGHT_LIMITS = {60: 6000}
-_EXCHANGE_CACHE = None
-_EXCHANGE_AT = 0.0
+_NEXT_REQUEST = dict.fromkeys(MARKET_NAMES, 0.0)
+_WEIGHT_LIMITS = {market: {60: 6000 if market == "spot" else 2400} for market in MARKET_NAMES}
+_EXCHANGE_CACHE = {}
+_EXCHANGE_AT = {}
+_METADATA_CACHE = {}
 
 
 class BinanceError(RuntimeError):
@@ -62,15 +71,15 @@ def _retry_after(value, fallback):
     return max(0.0, seconds) if math.isfinite(seconds) else fallback
 
 
-def _request(path: str, params=None, progress=lambda **_: None):
+def _request(path: str, params=None, progress=lambda **_: None, dataset="spot"):
     """GET with process-wide throttling and bounded, resumable retries."""
-    global _NEXT_REQUEST
-    url = BASE_URL + "/api/v3/" + path
+    dataset = _dataset(dataset)
+    url = _URLS[dataset] + path
     if params:
         url += "?" + urlencode(params)
     with _REQUEST_LOCK:
         for attempt in range(6):
-            wait = max(0, _NEXT_REQUEST - time.monotonic())
+            wait = max(0, _NEXT_REQUEST[dataset] - time.monotonic())
             if wait > 600:
                 raise BinanceError(f"Binance cooldown: retry in {math.ceil(wait)} seconds; "
                                    "download progress is saved", 429)
@@ -81,17 +90,17 @@ def _request(path: str, params=None, progress=lambda **_: None):
                              timeout=30) as response:
                     payload = json.load(response)
                     headers = response.headers
-                _NEXT_REQUEST = time.monotonic() + 0.2
+                _NEXT_REQUEST[dataset] = time.monotonic() + 0.2
                 # Read the IP's actual consumption, including other programs.
                 units = {"S": 1, "M": 60, "H": 3600, "D": 86400}
                 for key, value in headers.items():
                     suffix = key.lower().removeprefix("x-mbx-used-weight-")
                     if key.lower().startswith("x-mbx-used-weight-") and suffix[:-1].isdigit():
                         interval = int(suffix[:-1]) * units.get(suffix[-1:].upper(), 0)
-                        cap = _WEIGHT_LIMITS.get(interval)
+                        cap = _WEIGHT_LIMITS[dataset].get(interval)
                         if cap and int(value) >= cap * 0.9:
                             until_reset = interval - time.time() % interval + 1
-                            _NEXT_REQUEST = max(_NEXT_REQUEST, time.monotonic() + until_reset)
+                            _NEXT_REQUEST[dataset] = max(_NEXT_REQUEST[dataset], time.monotonic() + until_reset)
                 progress(retry_at=None)
                 return payload
             except HTTPError as exc:
@@ -106,13 +115,13 @@ def _request(path: str, params=None, progress=lambda **_: None):
                     raise BinanceError("Binance: " + message, exc.code) from exc
                 delay = _retry_after(exc.headers.get("Retry-After"),
                                      60 * 2 ** attempt if exc.code in (418, 429) else 2 ** attempt)
-                _NEXT_REQUEST = time.monotonic() + delay
+                _NEXT_REQUEST[dataset] = time.monotonic() + delay
                 if attempt == 5 or delay > 600:
                     raise BinanceError(f"Binance HTTP {exc.code}: {message}; retry in "
                                        f"{math.ceil(delay)} seconds. Download progress is saved",
                                        exc.code) from exc
             except (URLError, TimeoutError, OSError) as exc:
-                _NEXT_REQUEST = time.monotonic() + 2 ** attempt
+                _NEXT_REQUEST[dataset] = time.monotonic() + 2 ** attempt
                 if attempt == 5:
                     raise BinanceError("Binance connection failed; download progress is saved: "
                                        + str(exc)) from exc
@@ -120,48 +129,73 @@ def _request(path: str, params=None, progress=lambda **_: None):
                 raise BinanceError("Binance returned an invalid response") from exc
 
 
+def _dataset(dataset):
+    if dataset not in MARKET_NAMES:
+        raise ValueError("choose a Binance market: " + ", ".join(MARKET_NAMES))
+    return dataset
+
+
 def _symbol(symbol):
     symbol = str(symbol).strip().upper()
-    if not symbol or len(symbol) > 40 or not symbol.isalnum():
-        raise ValueError("choose a Binance Spot symbol such as BTCUSDT")
+    if not symbol or len(symbol) > 40 or not symbol[0].isalnum() or not symbol.replace("_", "").isalnum():
+        raise ValueError("choose a Binance symbol such as BTCUSDT or BTCUSD_PERP")
     return symbol
 
 
-def _exchange_info():
-    global _EXCHANGE_CACHE, _EXCHANGE_AT, _WEIGHT_LIMITS
-    if _EXCHANGE_CACHE is None or time.monotonic() - _EXCHANGE_AT > 600:
-        data = _request("exchangeInfo", {"permissions": "SPOT", "showPermissionSets": "false"})
+def _exchange_info(dataset="spot"):
+    dataset = _dataset(dataset)
+    if dataset not in _EXCHANGE_CACHE or time.monotonic() - _EXCHANGE_AT[dataset] > 600:
+        params = {"permissions": "SPOT", "showPermissionSets": "false"} if dataset == "spot" else None
+        data = _request("exchangeInfo", params, dataset=dataset)
         if not isinstance(data, dict) or not isinstance(data.get("symbols"), list):
             raise BinanceError("Binance returned an invalid symbol catalog")
         units = {"SECOND": 1, "MINUTE": 60, "HOUR": 3600, "DAY": 86400}
         limits = {units[r["interval"]] * int(r["intervalNum"]): int(r["limit"])
                   for r in data.get("rateLimits", [])
                   if r.get("rateLimitType") == "REQUEST_WEIGHT" and r.get("interval") in units}
-        _WEIGHT_LIMITS = limits or _WEIGHT_LIMITS
-        _EXCHANGE_CACHE, _EXCHANGE_AT = data, time.monotonic()
-    return _EXCHANGE_CACHE
+        _WEIGHT_LIMITS[dataset] = limits or _WEIGHT_LIMITS[dataset]
+        _EXCHANGE_CACHE[dataset], _EXCHANGE_AT[dataset] = data, time.monotonic()
+    return _EXCHANGE_CACHE[dataset]
 
 
 def overview():
-    return {"meta": {"candle_classes": ["spot"], "synth_candle_classes": [],
+    return {"meta": {"candle_classes": list(MARKET_NAMES), "synth_candle_classes": [],
                      "series_classes": [], "timeframes": list(TIMEFRAMES)},
             "reference": [], "usage": None}
 
 
-def catalog(query="", limit=300):
+def catalog(query="", limit=300, dataset="spot"):
+    dataset = _dataset(dataset)
     query = query.strip().upper()
-    rows = [{"symbol": r["symbol"], "name": f"{r['baseAsset']} / {r['quoteAsset']}",
-             "base_asset": r["baseAsset"], "quote_asset": r["quoteAsset"],
-             "status": r.get("status", ""), "dataset": "spot"}
-            for r in _exchange_info()["symbols"]]
+    rows = []
+    for r in _exchange_info(dataset)["symbols"]:
+        contract = r.get("contractType", "")
+        name = f"{r['baseAsset']} / {r['quoteAsset']}"
+        if contract:
+            name += " · " + contract.replace("_", " ").title()
+        rows.append({"symbol": r["symbol"], "name": name,
+                     "base_asset": r["baseAsset"], "quote_asset": r["quoteAsset"],
+                     "margin_asset": r.get("marginAsset"), "contract_type": contract or None,
+                     "contract_size": r.get("contractSize"),
+                     "status": r.get("contractStatus", r.get("status", "")), "dataset": dataset,
+                     "onboard_date": _iso(r["onboardDate"]) if r.get("onboardDate") else None,
+                     "delivery_date": _iso(r["deliveryDate"]) if r.get("deliveryDate") else None,
+                     "volume_unit": "contracts" if dataset == "coinm" else "base asset"})
     matches = [r for r in rows if query in r["symbol"].upper() or query in r["name"].upper()]
     matches.sort(key=lambda r: (not r["symbol"].upper().startswith(query),
                                r["quote_asset"] != "USDT", r["symbol"]))
     return {"total": len(rows), "rows": matches[:max(1, min(int(limit), 1000))]}
 
 
-def _time_ms(progress=lambda **_: None):
-    value = _request("time", progress=progress)
+def _instrument(symbol, dataset):
+    row = next((r for r in catalog(symbol, 1000, dataset)["rows"] if r["symbol"] == symbol), None)
+    if row is None:
+        raise ValueError(f"unknown Binance {MARKET_NAMES[dataset]} symbol: {symbol}")
+    return row
+
+
+def _time_ms(progress=lambda **_: None, dataset="spot"):
+    value = _request("time", progress=progress, dataset=dataset)
     if not isinstance(value, dict) or not isinstance(value.get("serverTime"), int):
         raise BinanceError("Binance returned invalid server time")
     return value["serverTime"]
@@ -171,19 +205,80 @@ def _iso(timestamp):
     return datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).isoformat()
 
 
-def metadata(symbol):
-    symbol = _symbol(symbol)
-    row = next((r for r in catalog(symbol, 1000)["rows"] if r["symbol"] == symbol), None)
-    if row is None:
-        raise ValueError("unknown Binance Spot symbol: " + symbol)
-    now = _time_ms()
-    first = _request("klines", {"symbol": symbol, "interval": "1m", "startTime": 0, "limit": 1})
-    last = _request("klines", {"symbol": symbol, "interval": "1m", "endTime": now - 1, "limit": 2})
-    first = _parse_rows(first, 0, now, 60_000)
-    last = _parse_rows(last, 0, now, 60_000)
-    return {**row, "first_tick": _iso(first[0][0]) if first else None,
-            "last_tick": _iso(last[-1][0]) if last else None,
-            "timeframes": list(TIMEFRAMES)}
+def _delivery_end(row, finish):
+    # Binance can emit flat, zero-volume candles long after a contract settles.
+    # Contract history ends at delivery, even if the API still emits those rows.
+    return min(finish, int(pd.Timestamp(row["delivery_date"]).timestamp() * 1000)) if row.get("delivery_date") else finish
+
+
+def _first_candle(symbol, timeframe, start, finish, dataset, progress=lambda **_: None):
+    interval = _MILLISECONDS[timeframe]
+    if dataset != "coinm":
+        rows = _request("klines", {"symbol": symbol, "interval": timeframe,
+                                  "startTime": start, "endTime": finish - 1, "limit": 1},
+                        progress, dataset=dataset)
+        return _parse_rows(rows, start, finish, interval)
+    # COIN-M documentation permits the *last* `limit` rows of <=200-day ranges.
+    # Find the first populated day in complete daily windows, then inspect at
+    # most two bounded minute pages. No onboard-date assumption (it can differ
+    # from the actual first candle). Binance did not exist before 2017.
+    day = max(start // _DAY * _DAY, 1483228800000)
+    while day < finish:
+        stop = min(finish, day + _MAX_FUTURES_WINDOW)
+        raw = _request("klines", {"symbol": symbol, "interval": "1d", "startTime": day,
+                                 "endTime": stop - 1, "limit": 1000}, progress, dataset=dataset)
+        coarse = _parse_rows(raw, day, stop + _DAY, _DAY)
+        if any(r[0] >= stop for r in coarse):
+            raise BinanceError("Binance returned candles outside the requested window")
+        if coarse:
+            # Weekly bars open on Monday, potentially before the first daily bar.
+            cursor = max(start, coarse[0][0] - (6 * _DAY if timeframe == "1w" else 0))
+            while cursor < min(finish, coarse[0][0] + _DAY):
+                stop = min(finish, cursor + min(1000 * interval, _MAX_FUTURES_WINDOW))
+                raw = _request("klines", {"symbol": symbol, "interval": timeframe, "startTime": cursor,
+                                         "endTime": stop - 1, "limit": 1000}, progress, dataset=dataset)
+                page = _parse_rows(raw, cursor, finish, interval)
+                if any(r[0] >= stop for r in page):
+                    raise BinanceError("Binance returned candles outside the requested window")
+                if page:
+                    return page[:1]
+                cursor = stop
+            # A custom start can fall after the last bar of this day. Continue
+            # looking at later populated days instead of declaring no history.
+            day = coarse[0][0] + _DAY
+            continue
+        day = stop
+    return []
+
+
+def _last_candle(symbol, timeframe, start, finish, dataset, progress=lambda **_: None):
+    rows = _request("klines", {"symbol": symbol, "interval": timeframe,
+                              "endTime": finish - 1, "limit": 2}, progress, dataset=dataset)
+    return [r for r in _parse_rows(rows, 0, finish, _MILLISECONDS[timeframe]) if r[0] >= start][-1:]
+
+
+def metadata(symbol, dataset="spot", timeframe="1m"):
+    dataset, symbol = _dataset(dataset), _symbol(symbol)
+    if timeframe not in TIMEFRAMES:
+        raise ValueError("unsupported Binance interval; choose " + ", ".join(TIMEFRAMES))
+    key = (dataset, symbol, timeframe)
+    cached = _METADATA_CACHE.get(key)
+    if cached and time.monotonic() - cached[0] < 60:
+        return dict(cached[1])
+    row = _instrument(symbol, dataset)
+    now = _delivery_end(row, _time_ms(dataset=dataset))
+    first = _first_candle(symbol, timeframe, 0, now, dataset)
+    last = _last_candle(symbol, timeframe, 0, now, dataset)
+    available = bool(first and last)
+    span = last[-1][0] - first[0][0] + _MILLISECONDS[timeframe] if available else 0
+    result = {**row, "first_tick": _iso(first[0][0]) if available else None,
+              "last_tick": _iso(last[-1][0]) if available else None,
+              "timeframes": list(TIMEFRAMES), "timeframe": timeframe,
+              "available_history": available, "days": span / _DAY, "years": span / (_DAY * 365.25),
+              "estimated_bars": span // _MILLISECONDS[timeframe],
+              "estimate_note": "Estimate from first/last closed candle; exchange gaps may reduce the actual count."}
+    _METADATA_CACHE[key] = (time.monotonic(), result)
+    return dict(result)
 
 
 def _bounds(start, end, now):
@@ -234,20 +329,30 @@ def _parse_rows(rows, start, finish, interval):
     return parsed
 
 
-def download(symbol, timeframe, start, end, cache_dir: Path, progress=lambda **_: None):
+def download(symbol, timeframe, start, end, cache_dir: Path, progress=lambda **_: None, dataset="spot"):
     """Return closed OHLCV bars. Date-only ends include that entire UTC day.
 
     The cache holds one SQLite file per symbol/interval/requested range; every
     verified page is committed atomically. A retry with blank end extends the
     same file as new bars close. Library replacement is the caller's job.
+    Volume is native base-asset quantity for Spot/USD-M, contracts for COIN-M.
+    These are individual contract candles; funding and inverse P&L are not modeled.
     """
-    symbol = _symbol(symbol)
+    dataset, symbol = _dataset(dataset), _symbol(symbol)
     if timeframe not in TIMEFRAMES:
         raise ValueError("unsupported Binance interval; choose " + ", ".join(TIMEFRAMES))
-    now = _time_ms(progress)
+    now = _time_ms(progress, dataset)
     first, finish = _bounds(start, end, now)
+    if dataset != "spot":
+        finish = _delivery_end(_instrument(symbol, dataset), finish)
+        if first >= finish:
+            raise ValueError("Binance has no closed candles in this date range (contract has already expired)")
     interval = _MILLISECONDS[timeframe]
-    identity = json.dumps([1, symbol, timeframe, first, end or ""], ensure_ascii=True)
+    # Keep existing Spot checkpoints; futures can never share their identity.
+    identity_parts = [1, symbol, timeframe, first, end or ""]
+    if dataset != "spot":
+        identity_parts.insert(1, dataset)
+    identity = json.dumps(identity_parts, ensure_ascii=True)
     path = Path(cache_dir) / (hashlib.sha256(identity.encode()).hexdigest() + ".sqlite3")
     path.parent.mkdir(parents=True, exist_ok=True)
     progress(detail="waiting for the current Binance download")
@@ -258,15 +363,27 @@ def download(symbol, timeframe, start, end, cache_dir: Path, progress=lambda **_
         if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise BinanceError("Binance download checkpoint is damaged; remove " + str(path))
         count, latest = db.execute("SELECT COUNT(*), MAX(ts) FROM candles").fetchone()
-        cursor = latest + interval if latest is not None else first
+        head = _first_candle(symbol, timeframe, first, finish, dataset, progress) if dataset != "spot" else None
+        cursor = latest + interval if latest is not None else head[0][0] if head else first
+        if dataset != "spot" and not head:
+            cursor = finish
         progress(rows=count, detail=f"resuming {count:,} verified candles" if count else "downloading Binance candles")
         pages = 0
         while cursor < finish:
+            # At most 1,000 possible opens per window: safe whether the futures
+            # API returns the earliest or most recent rows when a limit applies.
+            stop = min(finish, cursor + min(1000 * interval, _MAX_FUTURES_WINDOW)) if dataset != "spot" else finish
             rows = _request("klines", {"symbol": symbol, "interval": timeframe,
-                                      "startTime": cursor, "endTime": finish - 1, "limit": 1000}, progress)
+                                      "startTime": cursor, "endTime": stop - 1, "limit": 1000},
+                            progress, dataset=dataset)
             page = _parse_rows(rows, cursor, finish, interval)
+            if any(r[0] >= stop for r in page):
+                raise BinanceError("Binance returned candles outside the requested window")
             if not page:
-                break
+                if dataset == "spot" or stop == finish:
+                    break
+                cursor = stop
+                continue  # Empty futures windows can precede later real candles.
             db.executemany("INSERT INTO candles VALUES (?, ?, ?, ?, ?, ?, ?)", page)
             db.commit()
             count += len(page)
@@ -279,12 +396,8 @@ def download(symbol, timeframe, start, end, cache_dir: Path, progress=lambda **_
 
         # Independent edge checks prevent a silent truncated success, including
         # a damaged checkpoint that lost its earliest rows.
-        head = _request("klines", {"symbol": symbol, "interval": timeframe, "startTime": first,
-                                  "endTime": finish - 1, "limit": 1}, progress)
-        head = _parse_rows(head, first, finish, interval)
-        tail = _request("klines", {"symbol": symbol, "interval": timeframe,
-                                  "endTime": finish - 1, "limit": 2}, progress)
-        tail = [r for r in _parse_rows(tail, 0, finish, interval) if r[0] >= first]
+        head = _first_candle(symbol, timeframe, first, finish, dataset, progress)
+        tail = _last_candle(symbol, timeframe, first, finish, dataset, progress)
         actual = db.execute("SELECT MIN(ts), MAX(ts) FROM candles").fetchone()
         if actual != (head[0][0] if head else None, tail[-1][0] if tail else None):
             raise BinanceError("Binance history is incomplete; retry to resume the saved download")

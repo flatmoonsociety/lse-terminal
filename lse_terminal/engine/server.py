@@ -5511,7 +5511,7 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "no such import job")
         return job
 
-    # Binance public Spot history shares the library and job response format,
+    # Binance public history shares the library and job response format,
     # but never needs an LSE key or uses the LSE export allowance.
     from lse_terminal.providers import binance_import
 
@@ -5524,12 +5524,21 @@ def create_app() -> FastAPI:
 
     @app.get("/api/binance/databank/catalog")
     def binance_catalog(dataset: str = "spot", query: str = "", limit: int = 300):
-        if dataset != "spot":
-            raise HTTPException(400, "Binance supports Spot candles here")
+        if dataset not in binance_import.MARKET_NAMES:
+            raise HTTPException(400, "Choose Binance Spot, USD-M Futures or COIN-M Futures")
         try:
-            return binance_import.catalog(query=query, limit=max(1, min(limit, 400)))
+            return binance_import.catalog(query=query, limit=max(1, min(limit, 400)), dataset=dataset)
         except Exception as e:
             raise HTTPException(502, f"Binance: {e}") from e
+
+    @app.get("/api/binance/databank/metadata")
+    def binance_metadata(symbol: str, dataset: str = "spot", timeframe: str = "1h"):
+        try:
+            return binance_import.metadata(symbol, dataset=dataset, timeframe=timeframe)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        except binance_import.BinanceError as e:
+            raise HTTPException(e.status if 400 <= e.status <= 599 else 502, str(e)) from e
 
     @app.post("/api/binance/databank/import")
     def binance_start_import(body: BinanceImportIn):
@@ -5537,8 +5546,9 @@ def create_app() -> FastAPI:
         import uuid as _uuid
         from lse_terminal.providers import userdata
 
-        if body.dataset != "spot":
-            raise HTTPException(400, "Binance supports Spot candles here")
+        dataset = body.dataset
+        if dataset not in binance_import.MARKET_NAMES:
+            raise HTTPException(400, "Choose Binance Spot, USD-M Futures or COIN-M Futures")
         try:
             symbol = binance_import._symbol(body.symbol)
             timeframe = body.timeframe
@@ -5548,34 +5558,46 @@ def create_app() -> FastAPI:
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
         folder = body.folder.strip()
-        request_key = (symbol, timeframe, body.start, body.end, folder)
+        request_key = (dataset, symbol, timeframe, body.start, body.end, folder)
         with binance_jobs_lock:
             for active in binance_jobs.values():
                 if active["status"] not in ("exporting", "importing"):
                     continue
                 if active["request"] == request_key:
                     return {"job_id": active["id"]}
-                if active["symbol"] == symbol and active["timeframe"] == timeframe:
-                    raise HTTPException(409, "This Binance symbol and timeframe are already downloading")
+                if (active["dataset"] == dataset and active["symbol"] == symbol
+                        and active["timeframe"] == timeframe):
+                    raise HTTPException(409, "This Binance market, symbol and timeframe are already downloading")
             job_id = _uuid.uuid4().hex[:12]
             job = {"id": job_id, "provider": "binance", "status": "exporting",
-                   "dataset": "spot", "symbol": symbol, "timeframe": timeframe,
-                   "request": request_key, "detail": "checking Binance Spot history"}
+                   "dataset": dataset, "symbol": symbol, "timeframe": timeframe,
+                   "request": request_key, "detail": f"checking Binance {binance_import.MARKET_NAMES[dataset]} history"}
             binance_jobs[job_id] = job
 
         def run_binance():
             try:
+                import hashlib
+
+                instrument = next((row for row in binance_import.catalog(
+                    query=symbol, limit=1000, dataset=dataset)["rows"] if row["symbol"] == symbol), None)
+                if instrument is None:
+                    raise ValueError(f"Unknown Binance {binance_import.MARKET_NAMES[dataset]} symbol: {symbol}")
                 frame = binance_import.download(
                     symbol, timeframe, body.start, body.end,
                     cache_dir=userdata.data_dir() / "binance" / ".downloads",
                     progress=lambda **fields: job.update(fields),
+                    dataset=dataset,
                 )
                 job.update(status="importing", detail="saving candles to the library")
+                # Unicode tickers appear in Binance's real catalog. Keep their
+                # filenames distinct after the library's ASCII slug conversion.
+                symbol_id = symbol if symbol.isascii() else "U-" + hashlib.sha256(symbol.encode("utf-8")).hexdigest()
                 with binance_jobs_lock:
                     entry = userdata.import_table(
-                        f"BINANCE_SPOT_{symbol}_{timeframe.upper()}", frame,
-                        name=f"{symbol} · Binance Spot", folder=folder,
+                        f"BINANCE_{dataset.upper()}_{symbol_id}_{timeframe.upper()}", frame,
+                        name=f"{symbol} · Binance {binance_import.MARKET_NAMES[dataset]}", folder=folder,
                         source_ext=".csv", source="binance", timeframe=timeframe,
+                        instrument={**instrument, "exchange": "Binance", "dataset": dataset},
                     )
                 job.update(status="done", entry=entry,
                            detail=f"imported {entry['rows']} closed candles")
