@@ -26,6 +26,8 @@ from urllib.request import Request, urlopen
 import numpy as np
 import pandas as pd
 
+from lse_terminal import __version__
+
 MARKET_NAMES = {"spot": "Spot", "usdm": "USD-M Futures", "coinm": "COIN-M Futures"}
 _URLS = {"spot": "https://data-api.binance.vision/api/v3/",
          "usdm": "https://fapi.binance.com/fapi/v1/",
@@ -86,7 +88,7 @@ def _request(path: str, params=None, progress=lambda **_: None, dataset="spot"):
             if wait:
                 _pause(progress, "waiting for Binance request allowance", wait)
             try:
-                with urlopen(Request(url, headers={"User-Agent": "LSE-Terminal/0.0.15"}),
+                with urlopen(Request(url, headers={"User-Agent": f"LSE-Terminal/{__version__}"}),
                              timeout=30) as response:
                     payload = json.load(response)
                     headers = response.headers
