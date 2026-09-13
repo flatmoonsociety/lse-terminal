@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -1009,7 +1009,7 @@ def create_app() -> FastAPI:
     def saved_backtests_read(report_id: str):
         deny_hosted()
         try:
-            return saved_backtests.read(report_id)
+            return Response(saved_backtests.read_json(report_id), media_type="application/json")
         except KeyError:
             raise HTTPException(404, "saved backtest not found")
         except (OSError, sqlite3.Error, ValueError, EOFError) as e:
@@ -1109,7 +1109,9 @@ def create_app() -> FastAPI:
                                 data_files=_resolve_datasets(body.datasets))
         except BacktestError as e:
             raise HTTPException(400, str(e))
-        return result.to_json()
+        # The result contract already contains JSON primitives. Encode once in
+        # this worker, avoiding FastAPI's recursive copy on the event loop.
+        return JSONResponse(result.to_json())
 
     @app.post("/api/backtest/portfolio")
     def backtest_portfolio(body: PortfolioBacktestIn):
@@ -1125,10 +1127,11 @@ def create_app() -> FastAPI:
                               or component.timeframe != entry.get("timeframe", "?")):
                     raise BacktestError(f"Component {component.label!r} ({component.symbol}): "
                                         "select its imported OHLCV timeframe; portfolio runs do not resample data")
-            return run_portfolio(name=body.name, capital=body.capital, currency=body.currency,
+            result = run_portfolio(name=body.name, capital=body.capital, currency=body.currency,
                                  components=[component.model_dump() for component in body.components],
                                  provider=reg.get("userdata"), start=body.from_, end=body.to,
                                  data_files=_resolve_datasets([]))
+            return JSONResponse(result)
         except BacktestError as exc:
             raise HTTPException(400, str(exc))
 

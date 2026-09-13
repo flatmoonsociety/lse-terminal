@@ -96,3 +96,25 @@ def test_saved_reports_are_local_only(client, monkeypatch):
     assert hosted.post("/api/backtest/saved", json=report()).status_code == 403
     assert hosted.get("/api/backtest/saved/" + "a" * 32).status_code == 403
     assert hosted.delete("/api/backtest/saved/" + "a" * 32).status_code == 403
+
+
+def test_saved_report_serves_original_json_without_decode_encode_roundtrip(client, monkeypatch):
+    original = report()
+    original["result"]["equity_curve"] = [[i * 60, 100000 + i / 7] for i in range(10000)]
+    summary = client.post("/api/backtest/saved", json=original).json()
+    expected = saved_backtests.read_json(summary["id"])
+    # The response must reuse stored JSON, without an object-tree decode or
+    # FastAPI's per-point recursive copy. Both were expensive for full histories.
+    import fastapi.routing
+
+    def fail(*args, **kwargs):
+        raise AssertionError("saved report was decoded or recursively encoded")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(saved_backtests.json, "loads", fail)
+        patch.setattr(fastapi.routing, "jsonable_encoder", fail)
+        loaded = client.get(f"/api/backtest/saved/{summary['id']}")
+    assert loaded.status_code == 200
+    assert loaded.headers["content-type"] == "application/json"
+    assert loaded.content == expected
+    assert loaded.json()["result"] == original["result"]

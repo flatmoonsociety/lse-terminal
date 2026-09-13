@@ -91,12 +91,17 @@ def listing() -> list[dict]:
 
 
 def read(report_id: str) -> dict:
+    return json.loads(read_json(report_id))
+
+
+def read_json(report_id: str) -> bytes:
+    """Return the validated snapshot without rebuilding millions of Python lists."""
     _validate_id(report_id)
     with _database() as db:
         row = db.execute("SELECT payload FROM backtests WHERE id = ?", (report_id,)).fetchone()
     if row is None:
         raise KeyError(report_id)
-    return json.loads(gzip.decompress(row[0]))
+    return gzip.decompress(row[0])
 
 
 def delete(report_id: str) -> None:

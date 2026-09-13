@@ -7,7 +7,7 @@ const require = createRequire(new URL('../frontend/package.json', import.meta.ur
 const { transform } = require('esbuild');
 const source = readFileSync(new URL('../frontend/src/components/backtesting/strategyResults.ts', import.meta.url), 'utf8');
 const { code } = await transform(source, { loader: 'ts', format: 'esm' });
-const { calendarCagr, curveValueAt, strategyAnalytics, resultNumber, utcTime, tradeCsv } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
+const { calendarCagr, curveValueAt, sampleCurve, strategyAnalytics, resultNumber, utcTime, tradeCsv } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
 const ts = date => Date.parse(`${date}T00:00:00Z`) / 1000;
 const close = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`);
 const trade = (pnl, direction = 'long') => ({ entry_ts: 0, exit_ts: 3600, direction, entry_price: 100, exit_price: 110,
@@ -50,6 +50,29 @@ for (const [timestamp, strategyValue, holdValue] of [
 }
 assert.equal(curveValueAt([], first), null);
 for (const missing of [first - 60, first + 30, last + 60]) assert.equal(curveValueAt(originalStrategy, missing), null);
+
+// Sampling limits rendering work without hiding spikes, drawdown troughs, gaps
+// or range endpoints. Zooming back to a small interval restores every raw bar.
+const detailedCurve = Array.from({ length: 10_000 }, (_, i) => [first + i * 60, Math.sin(i / 10)]);
+detailedCurve[4321][1] = -1000;
+detailedCurve[5432][1] = 2000;
+detailedCurve[6000][1] = null;
+detailedCurve[6001][1] = null;
+const beforeSampling = JSON.stringify(detailedCurve);
+const sampled = sampleCurve(detailedCurve, 200);
+assert.ok(sampled.length <= 204, 'Display work is bounded, with extra points only to preserve gaps');
+for (const index of [0, 4321, 5432, 5999, 6000, 6001, 6002, 9999]) {
+  assert.ok(sampled.some(([ts, value]) => ts === detailedCurve[index][0] * 1000 && value === detailedCurve[index][1]), `Observation ${index} must survive sampling`);
+}
+assert.ok(sampled.every((point, i) => !i || sampled[i - 1][0] < point[0]), 'Chart samples stay in time order');
+const zoomed = sampleCurve(detailedCurve, 200, detailedCurve[4300][0], detailedCurve[4350][0]);
+assert.deepEqual(zoomed, detailedCurve.slice(4299, 4351).map(([ts, value]) => [ts * 1000, value]), 'A zoomed region restores raw observations and its left continuity point');
+assert.deepEqual(sampleCurve([], 200), []);
+assert.deepEqual(sampleCurve(detailedCurve, 200, 10, 0), []);
+assert.equal(JSON.stringify(detailedCurve), beforeSampling, 'Charts cannot mutate the result used by exports and analytics');
+const terminalGap = Array.from({ length: 10000 }, (_, i) => [i, i === 9999 ? null : 1]);
+assert.ok(sampleCurve(terminalGap, 200).some(([ts, value]) => ts === 9998000 && value === 1),
+  'A gap at the final observation retains the preceding finite boundary');
 close(calendarCagr(sparse, 100000, 366215), 13.4506088911);
 close(calendarCagr(dense, 100000, 366215), calendarCagr(sparse, 100000, 366215));
 const compared = strategyAnalytics({ ...result, initial_capital: 100000, final_equity: 366215,

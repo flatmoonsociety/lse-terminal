@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import * as echarts from 'echarts';
-import { finite, resultNumber as number, utcTime, curveValueAt, tradeCsv, strategyAnalytics, type StrategyResult, type StrategyTrade } from './strategyResults';
+import { finite, resultNumber as number, utcTime, curveValueAt, sampleCurve, tradeCsv, strategyAnalytics, type StrategyResult, type StrategyTrade } from './strategyResults';
 import { robustnessSummary, bootstrapDailyEquity } from './strategyRobustness';
 import StrategyValidation, { type ResearchRequest, type ValidationRun } from './StrategyValidation';
 
@@ -106,6 +106,9 @@ const tone = (value: unknown) => !finite(value) || value === 0 ? '' : value > 0 
 const pct = (value: unknown) => finite(value) ? `${number(value)}%` : '—';
 const compact = (value: number) => new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
 const precise = (value: unknown) => finite(value) ? value.toLocaleString('en-US', { maximumSignificantDigits: 15 }) : '—';
+// Keep raw time series outside ECharts' options so its own deep copies only see
+// the display sample. The original observations remain available for every zoom.
+const lineSources = new WeakMap<object, [number, number | null][]>();
 
 function Chart({ title, option, large = false }: { title: string; option: echarts.EChartsOption; large?: boolean }) {
   const host = useRef<HTMLDivElement>(null);
@@ -116,6 +119,15 @@ function Chart({ title, option, large = false }: { title: string; option: echart
     const printable = !!host.current.closest('.sbr-print');
     const chart = echarts.init(host.current, undefined, { renderer: printable ? 'svg' : 'canvas' });
     const chartDocument = host.current.ownerDocument;
+    const series = Array.isArray(option.series) ? option.series : option.series ? [option.series] : [];
+    const sources = series.map(s => lineSources.get(s));
+    const samples = sources.map(curve => curve ? sampleCurve(curve) : null);
+    const sampledSeries = series.map((s, i) => samples[i] ? { ...s, data: samples[i] } : s);
+    let domainStart = Infinity, domainEnd = -Infinity;
+    for (const curve of sources) if (curve?.length) {
+      domainStart = Math.min(domainStart, curve[0][0]);
+      domainEnd = Math.max(domainEnd, curve[curve.length - 1][0]);
+    }
     const render = () => {
       const styles = getComputedStyle(host.current!);
       const css = (name: string, fallback: string) => styles.getPropertyValue(name).trim() || fallback;
@@ -131,14 +143,29 @@ function Chart({ title, option, large = false }: { title: string; option: echart
         tooltip: { trigger: 'axis', confine: true, renderMode: 'richText', backgroundColor: css('--panel', '#1a1a1a'),
           borderColor: edge, textStyle: { color: ink, fontSize: 11 } },
         legend: { top: 0, textStyle: { color: dim, fontSize: 10 } },
-        xAxis: { type: 'time', axisLabel: { color: dim, fontSize: 10 }, axisLine: { lineStyle: { color: edge } } },
+        xAxis: { type: 'time', axisLabel: { color: dim, fontSize: 10 }, axisLine: { lineStyle: { color: edge } },
+          ...(finite(domainStart) && finite(domainEnd) ? { min: domainStart * 1000, max: domainEnd * 1000 } : {}) },
         yAxis: { type: 'value', scale: true, axisLabel: { color: dim, fontSize: 10, formatter: compact },
           splitLine: { lineStyle: { color: edge } } },
         ...option,
+        series: sampledSeries,
         ...(printable ? { dataZoom: [], tooltip: { show: false } } : {}),
       }, true);
     };
     render();
+    if (!printable && sources.some(Boolean)) chart.on('datazoom', (event: any) => {
+      const change = event.batch?.[0] || event;
+      if (!finite(change.start) || !finite(change.end)) return;
+      const start = domainStart + (domainEnd - domainStart) * change.start / 100;
+      const end = domainStart + (domainEnd - domainStart) * change.end / 100;
+      chart.setOption({ series: series.map((s, i) => {
+        const curve = sources[i], overview = samples[i];
+        if (!curve || !overview) return {};
+        const detail = sampleCurve(curve, 2000, start, end);
+        const first = detail[0]?.[0], last = detail[detail.length - 1]?.[0];
+        return { data: [...overview.filter(p => p[0] < first), ...detail, ...overview.filter(p => p[0] > last)] };
+      }) });
+    });
     const resize = new ResizeObserver(() => chart.resize());
     resize.observe(host.current);
     const theme = new MutationObserver(render);
@@ -207,11 +234,16 @@ function TradeLedger({ trades, filename, printable = false }: { trades: Strategy
   const [sort, setSort] = useState<SortKey>('id');
   const [descending, setDescending] = useState(false);
   const [page, setPage] = useState(0);
-  const filtered = useMemo(() => trades.map((trade, index) => ({ ...trade, id: index + 1 }))
-    .filter(t => (component === 'all' || t.component_id === component) && (side === 'all' || t.direction === side) && (outcome === 'all' ||
-      (outcome === 'win' && t.pnl > 0) || (outcome === 'loss' && t.pnl < 0) || (outcome === 'flat' && t.pnl === 0)))
-    .sort((a, b) => ((a[sort] ?? Infinity) - (b[sort] ?? Infinity)) * (descending ? -1 : 1)),
-  [trades, side, outcome, component, sort, descending]);
+  const filtered = useMemo(() => {
+    const indices: number[] = [];
+    trades.forEach((t, index) => {
+      if ((component === 'all' || t.component_id === component) && (side === 'all' || t.direction === side) && (outcome === 'all' ||
+        (outcome === 'win' && t.pnl > 0) || (outcome === 'loss' && t.pnl < 0) || (outcome === 'flat' && t.pnl === 0))) indices.push(index);
+    });
+    if (sort !== 'id') indices.sort((a, b) => ((trades[a][sort] ?? Infinity) - (trades[b][sort] ?? Infinity)) * (descending ? -1 : 1));
+    else if (descending) indices.reverse();
+    return indices;
+  }, [trades, side, outcome, component, sort, descending]);
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, pageCount - 1);
   const orderBy = (key: SortKey) => { setSort(key); setDescending(sort === key ? !descending : false); setPage(0); };
@@ -229,13 +261,13 @@ function TradeLedger({ trades, filename, printable = false }: { trades: Strategy
       <label>Outcome<select value={outcome} onChange={e => { setOutcome(e.target.value); setPage(0); }}>
         <option value="all">All outcomes</option><option value="win">Winners</option><option value="loss">Losers</option><option value="flat">Breakeven</option>
       </select></label>
-      <button disabled={!filtered.length} onClick={() => download(tradeCsv(filtered), `${filename}-trades.csv`, 'text/csv;charset=utf-8')}>Export filtered CSV</button>
+      <button disabled={!filtered.length} onClick={() => download(tradeCsv(filtered.map(i => ({ ...trades[i], id: i + 1 }))), `${filename}-trades.csv`, 'text/csv;charset=utf-8')}>Export filtered CSV</button>
       <span className="sbr-sub">{number(filtered.length, 0)} of {number(trades.length, 0)} trades</span>
     </div>}
     <div className="sbr-table-wrap" tabIndex={0} aria-label="Trade ledger, scroll horizontally for all columns">
       <table><thead><tr>{heading('id', '#')}{components.length > 0 && <><th>Component / strategy</th><th>Instrument</th></>}<th>Direction</th>{heading('entry_ts', 'Entry UTC')}{heading('exit_ts', 'Exit UTC')}
         <th>Entry price</th><th>Exit price</th><th>Quantity</th>{heading('gross_pnl', 'Gross P&L')}{heading('commission', 'Commission')}{heading('pnl', 'Net P&L')}{heading('pnl_pct', 'Net P&L %')}{heading('bars_held', 'Bars held')}
-      </tr></thead><tbody>{(printable ? filtered : filtered.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE)).map(t => <tr key={t.id}>
+      </tr></thead><tbody>{(printable ? filtered : filtered.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE)).map(i => ({ ...trades[i], id: i + 1 })).map(t => <tr key={t.id}>
         <td>{t.id}</td>{components.length > 0 && <><td>{t.component_label || t.component_id}<div className="sbr-sub">{t.strategy}</div></td><td>{t.symbol} · {t.timeframe}</td></>}<td>{t.direction}</td><td>{utcTime(t.entry_ts)}</td><td>{t.exit_ts == null ? 'Open' : utcTime(t.exit_ts)}</td>
         <td>{precise(t.entry_price)}</td><td>{precise(t.exit_price)}</td><td>{precise(t.qty)}</td>
         <td className={tone(t.gross_pnl)}>{number(t.gross_pnl)}</td><td>{number(t.commission)}</td>
@@ -254,10 +286,12 @@ const zoom: echarts.EChartsOption['dataZoom'] = [
   { type: 'inside', filterMode: 'none' },
   { type: 'slider', height: 15, bottom: 0, borderColor: 'transparent', showDetail: false },
 ];
-const line = (name: string, data: [number, number | null][], extra = {}): echarts.SeriesOption => ({
-  type: 'line', name, data: data.map(([ts, value]) => [ts * 1000, value]), showSymbol: false,
-  sampling: 'lttb', lineStyle: { width: 1.7 }, ...extra,
-});
+const line = (name: string, data: [number, number | null][], extra = {}): echarts.SeriesOption => {
+  const series: echarts.SeriesOption = { type: 'line', name, data: [], showSymbol: false,
+    lineStyle: { width: 1.7 }, ...extra };
+  lineSources.set(series, data);
+  return series;
+};
 
 function PortfolioBreakdown({ result, printable }: { result: StrategyResult; printable: boolean }) {
   const portfolio = result.portfolio!;
@@ -453,7 +487,9 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
   const benchmark = a.benchmark;
   const benchmarkName = portfolio ? 'Allocated buy & hold basket' : `Cash buy & hold · ${result.symbol}`;
   const equityName = portfolio ? 'Portfolio equity' : 'Strategy equity';
-  const plots = Object.entries(result.plots || {}).filter(([, values]) => values.length);
+  const plots = useMemo(() => Object.entries(result.plots || {}).filter(([, values]) => values.length), [result.plots]);
+  const plotCharts = useMemo(() => plots.map(([name, values]) => ({ name,
+    option: { dataZoom: zoom, series: [line(name, values)] } satisfies echarts.EChartsOption })), [plots]);
   const filename = `backtest-${result.symbol || 'strategy'}-${utcTime(a.equity[a.equity.length - 1]?.[0]).slice(0, 10)}`.replace(/[^a-zA-Z0-9_.-]/g, '_');
   const exportPdf = () => {
     printCleanup.current?.();
@@ -484,7 +520,7 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
   };
   const tabs = [['overview', 'Overview'], ['analysis', 'Trade analysis'], ['robustness', 'Robustness'], ['trades', 'Trade ledger'], ['statistics', 'Statistics'],
     ...(plots.length ? [['plots', `Strategy plots (${plots.length})`]] : [])];
-  const charts = useMemo(() => {
+  const overviewCharts = useMemo(() => {
     const returnColors = (v: number | null) => v == null || v >= 0 ? '#21b3a4' : '#f0426c';
     return {
       equity: { dataZoom: zoom, tooltip: { trigger: 'axis', confine: true, renderMode: 'richText',
@@ -505,6 +541,19 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
       daily: { xAxis: { type: 'category', data: a.days.map(d => d.period) },
         yAxis: { type: 'value', axisLabel: { formatter: '{value}%' } }, dataZoom: zoom,
         series: [{ type: 'bar', name: 'Daily return', data: a.days.map(d => ({ value: d.returnPct, itemStyle: { color: returnColors(d.returnPct) } })) }] },
+    } satisfies Record<string, echarts.EChartsOption>;
+  }, [a, benchmark, benchmarkName, equityName, result.initial_capital]);
+  const analysisCharts = useMemo(() => {
+    if (!printable && tab !== 'analysis') return null;
+    const returnColors = (v: number | null) => v == null || v >= 0 ? '#21b3a4' : '#f0426c';
+    const long: [number | null, number, number][] = [];
+    const short: [number | null, number, number][] = [];
+    a.trades.forEach((t, index) => {
+      const point: [number | null, number, number] = [portfolio ? t.exit_ts == null ? null : (t.exit_ts - t.entry_ts) / 3600 : t.bars_held, t.pnl, index + 1];
+      if (t.direction === 'long') long.push(point);
+      else if (t.direction === 'short') short.push(point);
+    });
+    return {
       histogram: { xAxis: { type: 'category', name: 'P&L range', nameLocation: 'middle', nameGap: 28,
         data: a.histogram.map(b => `${number(b.low)} to ${number(b.high)}`), axisLabel: { fontSize: 9, rotate: 20 } },
         yAxis: { type: 'value', name: 'Trades', minInterval: 1 }, tooltip: { trigger: 'axis', renderMode: 'richText', confine: true },
@@ -512,14 +561,13 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
       scatter: { xAxis: { type: 'value', name: portfolio ? 'Hours held' : 'Bars held', nameLocation: 'middle', nameGap: 25 },
         yAxis: { type: 'value', name: 'P&L', scale: true, axisLabel: { formatter: compact } },
         tooltip: { trigger: 'item', renderMode: 'richText', confine: true },
-        series: ['long', 'short'].map(side => ({ name: side === 'long' ? 'Long' : 'Short', type: 'scatter', symbolSize: 7,
-          dimensions: [portfolio ? 'Hours held' : 'Bars held', 'P&L', 'Trade #'], encode: { x: 0, y: 1, tooltip: [0, 1, 2] },
-          data: a.trades.map((t, index) => [portfolio ? t.exit_ts == null ? null : (t.exit_ts - t.entry_ts) / 3600 : t.bars_held, t.pnl, index + 1, t.direction]).filter(t => t[3] === side).map(t => t.slice(0, 3)) })) },
+        series: [{ name: 'Long', type: 'scatter', symbolSize: 7, dimensions: [portfolio ? 'Hours held' : 'Bars held', 'P&L', 'Trade #'], encode: { x: 0, y: 1, tooltip: [0, 1, 2] }, data: long },
+          { name: 'Short', type: 'scatter', symbolSize: 7, dimensions: [portfolio ? 'Hours held' : 'Bars held', 'P&L', 'Trade #'], encode: { x: 0, y: 1, tooltip: [0, 1, 2] }, data: short }] },
       tradePnl: { xAxis: { type: 'category', name: 'Trade #', data: a.trades.map((_, i) => i + 1) },
         yAxis: { type: 'value', name: 'P&L', axisLabel: { formatter: compact } }, dataZoom: zoom,
         series: [{ type: 'bar', name: 'Trade P&L', data: a.trades.map(t => ({ value: t.pnl, itemStyle: { color: returnColors(t.pnl) } })) }] },
     } satisfies Record<string, echarts.EChartsOption>;
-  }, [a, benchmark, benchmarkName, equityName, portfolio, result.initial_capital]);
+  }, [a, portfolio, printable, tab]);
   const annualNote = 'CAGR uses actual calendar time between the first and last observations, with a 365.25-day year. Engine risk ratios scale by observed return intervals per calendar year. Short samples can produce extreme annualized values.';
   const monthsByYear = Array.from(new Set(a.months.map(m => m.period.slice(0, 4))));
   const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -567,13 +615,15 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
         <div className="sbr-grid">
           <CommissionBreakdown result={result} />
           <Card title="Equity curve" subtitle={`${number(a.equity.length, 0)} bars · ${number(a.trades.length, 0)} trades`} full>
-            {a.equity.length ? <Chart title="Strategy equity versus a same-capital cash buy-and-hold portfolio" option={charts.equity} large /> : <p className="sbr-empty">No equity observations were returned by this run.</p>}
+            {a.equity.length ? <Chart title="Strategy equity versus a same-capital cash buy-and-hold portfolio" option={overviewCharts.equity} large /> : <p className="sbr-empty">No equity observations were returned by this run.</p>}
             <p className="sbr-note">{utcTime(a.equity[0]?.[0])} — {utcTime(a.equity[a.equity.length - 1]?.[0])} UTC.
               {' '}Initial capital {number(result.initial_capital)} · final equity {number(result.final_equity)}.
               {benchmark.length > 0 && (portfolio
                 ? ' The buy & hold basket invests each allocation at that component’s first observed close and holds fractional units until its final observation; allocations remain cash outside their data coverage. It includes unallocated cash and excludes dividends, fees, taxes, futures margin and roll costs.'
                 : ` Cash buy & hold invests the same ${number(result.initial_capital)} at the first observed ${result.symbol} close and holds a fixed number of fractional units: portfolio value = starting capital × (current close ÷ first close). It excludes dividends, fees and taxes. For futures this is a price-based cash proxy; it does not simulate a one-contract hold, margin or roll costs.`)}
-              {!printable && ' Scroll to zoom; drag the range below each time chart.'} Monetary values use {portfolio?.currency || 'the strategy account units'}.</p>
+              {printable ? ' Time charts are sampled for readability; statistics and the JSON export retain all observations.'
+                : ' Scroll to zoom; drag the range below each time chart. Charts adapt to the visible range; statistics and data exports use all observations.'}
+              {' '}Monetary values use {portfolio?.currency || 'the strategy account units'}.</p>
           </Card>
           {portfolio && <PortfolioBreakdown result={result} printable={printable} />}
           {benchmark.length > 0 && <Card title="Strategy versus same-capital buy & hold" subtitle={result.symbol} full>
@@ -585,11 +635,11 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
             <p className="sbr-note">Both series use the same starting cash. {portfolio ? 'The benchmark uses the same component allocations and coverage dates, plus unused cash. Repeated instruments retain their separate allocations.' : 'The benchmark is a fractional-unit cash investment in the selected price series; it is not the return from holding the strategy’s contract quantity.'}</p>
           </Card>}
           <Card title="Drawdown" subtitle="Decline from running equity peak">
-            <Chart title="Percentage drawdown from running equity peak, including initial capital" option={charts.drawdown} />
+            <Chart title="Percentage drawdown from running equity peak, including initial capital" option={overviewCharts.drawdown} />
             <p className="sbr-note">Maximum {number(a.maxDrawdown)} ({pct(a.maxDrawdownPct)}). Initial capital is included in the starting peak.</p>
           </Card>
           <Card title="Daily returns" subtitle="Observed daily closes · UTC">
-            <Chart title="Daily percentage returns based on observed closing equity" option={charts.daily} />
+            <Chart title="Daily percentage returns based on observed closing equity" option={overviewCharts.daily} />
             <p className="sbr-note">The first day is partial when the run starts intraday. Returns following nonpositive equity are unavailable.</p>
           </Card>
           <Card title="Monthly returns" subtitle="Return from the previous observed month-end" full>
@@ -612,9 +662,9 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
           ].map(([label, value, color]) => <div className="sbr-kpi" key={label}><div className="sbr-label">{label}</div><div className={`sbr-value ${color}`}>{value}</div></div>)}</div>
           <p className="sbr-note">Payoff ratio = average winning trade ÷ absolute average losing trade. Breakeven trades are shown separately here.</p>
         </Card>
-        <Card title="P&L distribution" subtitle="Trade count by P&L range"><Chart title="Histogram of trade profit and loss" option={charts.histogram} /></Card>
-        <Card title="Holding time vs P&L" subtitle={portfolio ? 'Hours elapsed · comparable across timeframes' : 'Each point is one trade'}><Chart title={portfolio ? 'Trade P&L by elapsed hours, grouped by direction' : 'Trade P&L by bars held, grouped by direction'} option={charts.scatter} /></Card>
-        <Card title="Trade P&L" subtitle="Order returned by the engine" full><Chart title="Profit and loss for every trade" option={charts.tradePnl} /></Card>
+        <Card title="P&L distribution" subtitle="Trade count by P&L range"><Chart title="Histogram of trade profit and loss" option={analysisCharts!.histogram} /></Card>
+        <Card title="Holding time vs P&L" subtitle={portfolio ? 'Hours elapsed · comparable across timeframes' : 'Each point is one trade'}><Chart title={portfolio ? 'Trade P&L by elapsed hours, grouped by direction' : 'Trade P&L by bars held, grouped by direction'} option={analysisCharts!.scatter} /></Card>
+        <Card title="Trade P&L" subtitle="Order returned by the engine" full><Chart title="Profit and loss for every trade" option={analysisCharts!.tradePnl} /></Card>
         <Card title="Long / short performance" full><div className="sbr-table-wrap"><table><thead><tr><th>Direction</th><th>Trades</th><th>Net P&L</th><th>Win rate</th><th>Average trade</th></tr></thead>
           <tbody>{a.direction.map(d => <tr key={d.side}><td>{d.side}</td><td>{d.count}</td><td className={tone(d.net)}>{number(d.net)}</td><td>{pct(d.winRate)}</td><td className={tone(d.average)}>{number(d.average)}</td></tr>)}</tbody></table></div></Card>
       </div>}
@@ -660,8 +710,8 @@ export default function StrategyBacktestResults({ result, strategy, elapsedMs, o
         ]} /><p className="sbr-note">{annualNote}</p><p className="sbr-note">— means unavailable. Export JSON preserves the original engine result and strategy plot data.</p></Card>
       </div>}
       {printable && plots.length > 0 && <h2 className="sbr-section-title sbr-page-break">Strategy plots</h2>}
-      {(printable || tab === 'plots') && <div className="sbr-grid">{plots.map(([name, values]) => <Card key={name} title={name} full>
-        <Chart title={`Strategy plot: ${name}`} option={{ dataZoom: zoom, series: [line(name, values)] }} />
+      {(printable || tab === 'plots') && <div className="sbr-grid">{plotCharts.map(({ name, option }) => <Card key={name} title={name} full>
+        <Chart title={`Strategy plot: ${name}`} option={option} />
       </Card>)}</div>}
     </div>
   </div>;

@@ -60,6 +60,7 @@ part nobody wants to write twice and the part that is easy to get quietly wrong.
 from __future__ import annotations
 
 import ctypes
+import functools
 import math
 import os
 import threading
@@ -132,6 +133,12 @@ class _StrategyTimeout(Exception):
 _SET_ASYNC_EXC = ctypes.pythonapi.PyThreadState_SetAsyncExc
 _SET_ASYNC_EXC.argtypes = (ctypes.c_ulong, ctypes.py_object)
 _SET_ASYNC_EXC.restype = ctypes.c_int
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_strategy(script: str):
+    """Compile identical strategy text once (walk-forward reuses it per fold)."""
+    return compile(script, _SCRIPT_FILENAME, "exec")
 
 
 def _raise_in_thread(thread_id: int, exc) -> int:
@@ -401,7 +408,7 @@ class PythonRunner(BacktestEngine):
         on the user's own machine, so a plain exec is the honest thing to do.
         """
         try:
-            code = compile(script, _SCRIPT_FILENAME, "exec")
+            code = _compile_strategy(script)
         except SyntaxError as e:
             raise BacktestError(
                 f"syntax error at line {e.lineno}: {e.msg}") from None
@@ -632,7 +639,6 @@ class PythonRunner(BacktestEngine):
 
         # Per-bar realized cash change and open exposure, walked once.
         realized = np.zeros(n + 1, dtype="float64")
-        open_at = [[] for _ in range(n)]     # trades live on each bar
 
         cash = capital
         # Entry order is already sorted; committed tracks capital tied up in
@@ -692,31 +698,35 @@ class PythonRunner(BacktestEngine):
                 t.pnl = float(gross - fee - entry_fee)
                 t.pnl_pct = float(t.pnl / notional * 100.0) if notional else 0.0
 
+        # Mark to market with vectorized interval slices.  This keeps each
+        # trade's ``(close - entry) * qty * point_value`` arithmetic intact (including
+        # tiny P&L at very large prices), while moving the inner bar loop into
+        # NumPy's C implementation.
+        unreal = np.zeros(n, dtype="float64")
+        active_delta = np.zeros(n + 1, dtype="int64")
         for k, t in enumerate(trades):
-            for b in range(t._entry_i, t._exit_i):       # type: ignore
-                open_at[b].append(k)
+            entry_i = t._entry_i  # type: ignore[attr-defined]
+            exit_i = t._exit_i    # type: ignore[attr-defined]
+            if exit_i <= entry_i:
+                continue
+            qty = sized.get(k, 0.0)
+            prices = close[entry_i:exit_i]
+            movement = prices - t.entry_price if t.direction == "long" else t.entry_price - prices
+            unreal[entry_i:exit_i] += movement * qty * t.point_value
+            active_delta[entry_i] += 1
+            active_delta[exit_i] -= 1
 
-        # Equity per bar: realized cash so far, plus every open position marked
-        # to that bar's close. Mark to market matters because drawdown measured
-        # only at trade exits understates what the account actually went through.
-        equity_curve: list[list[float]] = []
-        running = capital
-        bars_in_market = 0
-        for i in range(n):
-            running += realized[i]
-            unreal = 0.0
-            for k in open_at[i]:
-                t = trades[k]
-                qty = sized.get(k, 0.0)
-                if t.direction == "long":
-                    unreal += (close[i] - t.entry_price) * qty * t.point_value
-                else:
-                    unreal += (t.entry_price - close[i]) * qty * t.point_value
-            if open_at[i]:
-                bars_in_market += 1
-            equity_curve.append([int(ts[i]), float(running + unreal)])
+        # Seed the cumulative sum with capital to retain the original per-bar
+        # addition order, including floating-point rounding.
+        if n:
+            realized[0] += capital
+        running = np.cumsum(realized[:n])
+        active = np.cumsum(active_delta[:-1])
+        marked = running + unreal
+        equity_curve = [[int(t), float(v)] for t, v in zip(ts, marked)]
+        bars_in_market = int(np.count_nonzero(active))
 
-        final_equity = float(running)
+        final_equity = float(running[-1]) if n else float(capital)
         return equity_curve, final_equity, bars_in_market
 
     # ── research modes ────────────────────────────────────────────────
